@@ -16,7 +16,6 @@ import net.psforever.objects.zones.Zone
   * A wrapper for a "damage source" in damage calculations
   * that parameterizes information necessary to explain a server-driven explosion occurring.
   * Some game objects cause area-of-effect damage upon being destroyed.
-  * @see `VitalityDefinition.explodes`
   * @see `VitalityDefinition.innateDamage`
   * @see `Zone.causesExplosion`
   * @param entity what is accredited as the source of the explosive yield
@@ -61,7 +60,7 @@ object ExplodingEntityReason {
              instigation: Option[DamageResult]
            ): ExplodingEntityReason = {
     val definition = entity.Definition.asInstanceOf[ObjectDefinition with VitalityDefinition]
-    assert(definition.explodes && definition.innateDamage.nonEmpty, "causal entity does not explode")
+    assert(definition.innateDamage.nonEmpty, "causal entity does not explode")
     ExplodingEntityReason(SourceEntry(entity), definition.innateDamage.get, damageModel, instigation)
   }
 }
@@ -107,6 +106,16 @@ case object ExplodingRadialDegrade extends ExplodingDamageModifiers.Mod {
         }
       case _ =>
         damage
+    }
+  }
+}
+
+case object ExplosionDamagesOnlyAbove extends ExplodingDamageModifiers.Mod {
+  def calculate(damage: Int, data: DamageInteraction, cause: ExplodingEntityReason): Int = {
+    if (data.target.Position.z <= data.hitPos.z) {
+      damage
+    } else {
+      0
     }
   }
 }

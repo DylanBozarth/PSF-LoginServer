@@ -61,7 +61,7 @@ class DamageCalculationsTests extends Specification {
     }
 
     "extract damage against battleframe robotics" in {
-      AgainstBFR(proj_prof) == proj_prof.Damage4 mustEqual true
+      AgainstBfr(proj_prof) == proj_prof.Damage4 mustEqual true
     }
 
     "no degrade damage modifier" in {
@@ -921,7 +921,7 @@ class DamageModelTests extends Specification {
 }
 
 object DamageModelTests {
-  final val projectile = new ProjectileDefinition(Projectiles.heavy_grenade_projectile.id) {
+  final val projectile = new ProjectileDefinition(Projectiles.Types.heavy_grenade_projectile.id) {
     Damage0 = 50
     Damage1 = 82
     Damage2 = 82

@@ -15,7 +15,7 @@ class ProjectileDefinition(objectId: Int)
   extends ObjectDefinition(objectId)
     with DamageWithPosition {
   /** ascertain that this object is a valid projectile type */
-  private val projectileType: Projectiles.Value     = Projectiles(objectId) //let throw NoSuchElementException
+  private val projectileType: Projectiles.Types.Value     = Projectiles.Types(objectId) //let throw NoSuchElementException
   /** how much faster (or slower) the projectile moves (m/s^2^) */
   private var acceleration: Int                     = 0
   /** when the acceleration stops being applied (s) */
@@ -46,6 +46,8 @@ class ProjectileDefinition(objectId: Int)
   /** projectile takes the form of a type of "grenade";
     * grenades arc with gravity rather than travel in a relatively straight path */
   private var grenade_projectile: Boolean = false
+  /** radiation clouds create independent damage-dealing areas in a zone that last for the projectile's lifespan */
+  var radiation_cloud: Boolean = false
   //derived calculations
   /** the calculated distance at which the projectile have traveled far enough to despawn (m);
     * typically handled as the projectile no longer performing damage;
@@ -62,7 +64,7 @@ class ProjectileDefinition(objectId: Int)
   Modifiers = DistanceDegrade
   registerAs = "projectiles"
 
-  def ProjectileType: Projectiles.Value = projectileType
+  def ProjectileType: Projectiles.Types.Value = projectileType
 
   def Acceleration: Int = acceleration
 
@@ -174,7 +176,7 @@ class ProjectileDefinition(objectId: Int)
 }
 
 object ProjectileDefinition {
-  def apply(projectileType: Projectiles.Value): ProjectileDefinition = {
+  def apply(projectileType: Projectiles.Types.Value): ProjectileDefinition = {
     new ProjectileDefinition(projectileType.id)
   }
 

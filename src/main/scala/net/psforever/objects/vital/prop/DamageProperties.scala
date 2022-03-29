@@ -29,8 +29,10 @@ trait DamageProperties
   /** use a specific modifier as a part of damage calculations */
   private var useDamage1Subtract: Boolean                = false
   /** some other entity confers damage;
-    * a set value should not `None` and not `0` but is preferred to be the damager's uid */
-  private var damageProxy: Option[Int]                   = None
+    * a set value should be the damager's object uid
+    * usually corresponding to a projectile;
+    * also used to produce staged projectiles */
+  private var damageProxy: List[Int]                   = Nil
   /** na;
     * currently used with jammer properties only */
   private var additionalEffect: Boolean                  = false
@@ -87,11 +89,14 @@ trait DamageProperties
     DamageToBattleframeOnly
   }
 
-  def DamageProxy : Option[Int] = damageProxy
+  def DamageProxy : List[Int] = damageProxy
 
-  def DamageProxy_=(proxyObjectId : Int) : Option[Int] = DamageProxy_=(Some(proxyObjectId))
+  def DamageProxy_=(proxyObjectId: Int): List[Int] = {
+    damageProxy = damageProxy :+ proxyObjectId
+    DamageProxy
+  }
 
-  def DamageProxy_=(proxyObjectId : Option[Int]) : Option[Int] = {
+  def DamageProxy_=(proxyObjectId: List[Int]): List[Int] = {
     damageProxy = proxyObjectId
     DamageProxy
   }
