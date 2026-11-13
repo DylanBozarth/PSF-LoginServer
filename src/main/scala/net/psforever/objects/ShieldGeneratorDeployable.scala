@@ -3,7 +3,7 @@ package net.psforever.objects
 
 import akka.actor.{Actor, ActorContext, Props}
 import net.psforever.objects.ce.{Deployable, DeployableBehavior, DeployableCategory}
-import net.psforever.objects.definition.DeployableDefinition
+import net.psforever.objects.definition.{DeployableDefinition, WithShields}
 import net.psforever.objects.definition.converter.ShieldGeneratorConverter
 import net.psforever.objects.equipment.{JammableBehavior, JammableUnit}
 import net.psforever.objects.serverobject.damage.Damageable.Target
@@ -13,20 +13,21 @@ import net.psforever.objects.serverobject.hackable.Hackable
 import net.psforever.objects.serverobject.repair.RepairableEntity
 import net.psforever.objects.vital.interaction.DamageResult
 import net.psforever.objects.vital.resolution.ResolutionCalculations
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.PlanetsideAttribute
 import net.psforever.types.PlanetSideGUID
-import net.psforever.services.Service
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
 
 class ShieldGeneratorDeployable(cdef: ShieldGeneratorDefinition)
     extends Deployable(cdef)
     with Hackable
     with JammableUnit
 
-class ShieldGeneratorDefinition extends DeployableDefinition(240) {
-  Packet = new ShieldGeneratorConverter
+class ShieldGeneratorDefinition extends DeployableDefinition(objectId = 240)
+  with WithShields {
+  Packet = ShieldGeneratorConverter
   DeployCategory = DeployableCategory.ShieldGenerators
 
-  override def Initialize(obj: Deployable, context: ActorContext) = {
+  override def Initialize(obj: Deployable, context: ActorContext): Unit = {
     obj.Actor =
       context.actorOf(Props(classOf[ShieldGeneratorControl], obj), PlanetSideServerObject.UniqueActorName(obj))
   }
@@ -38,10 +39,10 @@ class ShieldGeneratorControl(gen: ShieldGeneratorDeployable)
     with JammableBehavior
     with DamageableEntity
     with RepairableEntity {
-  def DeployableObject = gen
-  def JammableObject   = gen
-  def DamageableObject = gen
-  def RepairableObject = gen
+  def DeployableObject: ShieldGeneratorDeployable = gen
+  def JammableObject: ShieldGeneratorDeployable   = gen
+  def DamageableObject: ShieldGeneratorDeployable = gen
+  def RepairableObject: ShieldGeneratorDeployable = gen
   deletionType = 1 //from DeployableBehavior
 
   override def postStop(): Unit = {
@@ -89,7 +90,7 @@ class ShieldGeneratorControl(gen: ShieldGeneratorDeployable)
     val damageToShields = originalShields - shields
     val damage          = damageToHealth + damageToShields
     if (WillAffectTarget(target, damage, cause)) {
-      target.History(cause)
+      target.LogActivity(cause)
       DamageLog(
         target,
         s"BEFORE=$originalHealth/$originalShields, AFTER=$health/$shields, CHANGE=$damageToHealth/$damageToShields"
@@ -112,7 +113,7 @@ class ShieldGeneratorControl(gen: ShieldGeneratorDeployable)
 
   override protected def DestructionAwareness(target: Target, cause: DamageResult): Unit = {
     super.DestructionAwareness(target, cause)
-    ShieldGeneratorControl.DestructionAwareness(gen, PlanetSideGUID(0))
+    ShieldGeneratorControl.DestructionAwareness(gen, Default.GUID0)
   }
 
   /*
@@ -123,10 +124,10 @@ class ShieldGeneratorControl(gen: ShieldGeneratorDeployable)
 
   override def StartJammeredStatus(target: Any, dur: Int): Unit =
     target match {
-      case obj: PlanetSideServerObject with JammableUnit if !obj.Jammed =>
-        obj.Zone.VehicleEvents ! VehicleServiceMessage(
+      case obj: PlanetSideServerObject with JammableUnit =>
+        obj.Zone.VehicleEvents ! MessageEnvelope(
           obj.Zone.id,
-          VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, obj.GUID, 27, 1)
+          PlanetsideAttribute(obj.GUID, 27, 1)
         )
         super.StartJammeredStatus(obj, dur)
       case _ => ;
@@ -137,9 +138,9 @@ class ShieldGeneratorControl(gen: ShieldGeneratorDeployable)
   override def CancelJammeredStatus(target: Any): Unit = {
     target match {
       case obj: PlanetSideServerObject with JammableUnit if obj.Jammed =>
-        obj.Zone.VehicleEvents ! VehicleServiceMessage(
+        obj.Zone.VehicleEvents ! MessageEnvelope(
           obj.Zone.id,
-          VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, obj.GUID, 27, 0)
+          PlanetsideAttribute(obj.GUID, 27, 0)
         )
       case _ => ;
     }
@@ -159,9 +160,9 @@ object ShieldGeneratorControl {
     //shields
     if (damageToShields) {
       val zone = target.Zone
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zone.id,
-        VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, target.GUID, 68, target.Shields)
+        PlanetsideAttribute(target.GUID, 68, target.Shields)
       )
     }
   }

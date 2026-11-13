@@ -135,6 +135,8 @@ class SpecialExoSuitDefinition(private val suitType: ExoSuitType.Value) extends 
 
   override def Use: ExoSuitDefinition = {
     val obj = new SpecialExoSuitDefinition(SuitType)
+    obj.Name = Name
+    obj.Descriptor = Descriptor
     obj.Permissions = Permissions
     obj.MaxArmor = MaxArmor
     obj.MaxCapacitor = MaxCapacitor
@@ -150,6 +152,7 @@ class SpecialExoSuitDefinition(private val suitType: ExoSuitType.Value) extends 
     obj.ResistanceDirectHit = ResistanceDirectHit
     obj.ResistanceSplash = ResistanceSplash
     obj.ResistanceAggravated = ResistanceAggravated
+    obj.RadiationShielding = RadiationShielding
     obj.DamageUsing = DamageUsing
     obj.ResistUsing = ResistUsing
     obj.Model = Model
@@ -191,6 +194,7 @@ object ExoSuitDefinition {
           case PlanetSideEmpire.TR => GlobalDefinitions.TRMAX.Use
           case PlanetSideEmpire.NC => GlobalDefinitions.NCMAX.Use
           case PlanetSideEmpire.VS => GlobalDefinitions.VSMAX.Use
+          case _                   => GlobalDefinitions.Standard.Use
         }
       case _ => GlobalDefinitions.Standard.Use
     }

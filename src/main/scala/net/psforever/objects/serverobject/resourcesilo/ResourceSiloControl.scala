@@ -1,25 +1,32 @@
 // Copyright (c) 2019 PSForever
 package net.psforever.objects.serverobject.resourcesilo
 
-import akka.actor.{Actor, ActorRef}
+import akka.actor.{Actor, ActorRef, Cancellable}
 import net.psforever.objects.serverobject.CommonMessages
 import net.psforever.actors.zone.BuildingActor
 import net.psforever.objects.serverobject.affinity.{FactionAffinity, FactionAffinityBehavior}
 import net.psforever.objects.serverobject.transfer.TransferBehavior
 import net.psforever.objects.serverobject.structures.Building
-import net.psforever.objects.{GlobalDefinitions, Ntu, NtuContainer, NtuStorageBehavior}
-import net.psforever.types.PlanetSideEmpire
+import net.psforever.objects.zones
+import net.psforever.objects.{GlobalDefinitions, Ntu, NtuContainer, NtuStorageBehavior, Vehicle}
+import net.psforever.types.{ExperienceType, PlanetSideEmpire}
 import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.services.avatar.AvatarAction
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.base.message.PlanetsideAttribute
+import net.psforever.util.Config
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 
+object ResourceSiloControl {
+  final case class DrainMultiplier(multiplier: Float)
+}
+
 /**
-  * An `Actor` that handles messages being dispatched to a specific `Resource Silo`.
+  * An `Actor` that handles messages being dispatched to a specific `ResourceSilo` entity.
   *
-  * @param resourceSilo the `Resource Silo` object being governed
+  * @param resourceSilo the `ResourceSilo` entity being governed
   */
 class ResourceSiloControl(resourceSilo: ResourceSilo)
     extends Actor
@@ -28,10 +35,12 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
   def FactionObject: FactionAffinity = resourceSilo
 
   private[this] val log               = org.log4s.getLogger
-  var panelAnimationFunc: (ActorRef, Float) => Unit = PanelAnimation
+  private var panelAnimationFunc: (ActorRef, Float) => Unit = PanelAnimation
+  /** the higher the multiplier, the greater the drain */
+  private var drainMultiplier: Float = 1.0f
 
   def receive: Receive = {
-    case Service.Startup() =>
+    case Service.Startup =>
       resourceSilo.Owner match {
         case building: Building =>
           UpdateChargeLevel(amount = 0)
@@ -51,37 +60,34 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     checkBehavior
       .orElse(storageBehavior)
       .orElse {
-        case CommonMessages.Use(player, _) =>
+        case ResourceSiloControl.DrainMultiplier(multiplier) =>
+          drainMultiplier = multiplier
+
+        case CommonMessages.Use(_, Some(vehicle: Vehicle))
+          if GlobalDefinitions.isBattleFrameVehicle(vehicle.Definition) =>
           val siloFaction = resourceSilo.Faction
-          val playerFaction = player.Faction
-          resourceSilo.Zone.Vehicles.find(v => v.PassengerInSeat(player).contains(0)) match {
-            case Some(vehicle) =>
-              (if (GlobalDefinitions.isBattleFrameVehicle(vehicle.Definition)) {
-                //bfr's discharge into friendly silos and charge from enemy and neutral silos
-                if (siloFaction == playerFaction) {
-                  Some(TransferBehavior.Discharging(Ntu.Nanites))
-                } else if (resourceSilo.MaxNtuCapacitor * 0.4f < resourceSilo.NtuCapacitor) {
-                  //the bfr never drains below 40%
-                  Some(TransferBehavior.Charging(Ntu.Nanites))
-                } else {
-                  None
-                }
-              } else if(siloFaction == PlanetSideEmpire.NEUTRAL || siloFaction == playerFaction) {
-                //ants discharge into neutral and friendly silos
-                Some(TransferBehavior.Discharging(Ntu.Nanites))
-              } else {
-                None
-              }) match {
-                case Some(msg) =>
-                  context.system.scheduler.scheduleOnce(
-                    delay = 1000 milliseconds,
-                    vehicle.Actor,
-                    msg
-                  )
-                case None => ;
-              }
-            case _ => ;
+          val vehicleFaction = vehicle.Faction
+          val msgOpt = if (siloFaction == vehicleFaction) {
+            Some(TransferBehavior.Discharging(Ntu.Nanites))
+          } else if (resourceSilo.MaxNtuCapacitor * 0.4f < resourceSilo.NtuCapacitor) {
+            //the bfr never drains below 40%
+            Some(TransferBehavior.Charging(Ntu.Nanites))
+          } else {
+            None
           }
+          msgOpt.collect { SendNtuMessage(vehicle.Actor, _) }
+
+        case CommonMessages.Use(_, Some(vehicle: Vehicle))
+          if vehicle.Definition == GlobalDefinitions.ant =>
+          val siloFaction = resourceSilo.Faction
+          val vehicleFaction = vehicle.Faction
+          val msgOpt = if (siloFaction == PlanetSideEmpire.NEUTRAL || siloFaction == vehicleFaction) {
+            //ants discharge into neutral and friendly silos
+            Some(TransferBehavior.Discharging(Ntu.Nanites))
+          } else {
+            None
+          }
+          msgOpt.collect { SendNtuMessage(vehicle.Actor, _) }
 
         case ResourceSilo.LowNtuWarning(enabled: Boolean) =>
           LowNtuWarning(enabled)
@@ -89,17 +95,21 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
         case ResourceSilo.UpdateChargeLevel(amount: Float) =>
           UpdateChargeLevel(amount)
 
-        case _ => ;
+        case _ => ()
       }
+
+  def SendNtuMessage(replyTo: ActorRef, msg: Any): Cancellable = {
+    context.system.scheduler.scheduleOnce(delay = 1000 milliseconds, replyTo, msg)
+  }
 
   def LowNtuWarning(enabled: Boolean): Unit = {
     resourceSilo.LowNtuWarningOn = enabled
     log.trace(s"LowNtuWarning: Silo ${resourceSilo.GUID} low ntu warning set to $enabled")
     val building = resourceSilo.Owner
     val zone     = building.Zone
-    building.Zone.AvatarEvents ! AvatarServiceMessage(
+    building.Zone.AvatarEvents ! MessageEnvelope(
       zone.id,
-      AvatarAction.PlanetsideAttribute(building.GUID, 47, if (resourceSilo.LowNtuWarningOn) 1 else 0)
+      PlanetsideAttribute(building.GUID, 47, if (resourceSilo.LowNtuWarningOn) 1 else 0)
     )
   }
 
@@ -120,9 +130,9 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
       log.trace(
         s"UpdateChargeLevel: silo ${resourceSilo.GUID} NTU bar level has changed from $siloDisplayBeforeChange to ${resourceSilo.CapacitorDisplay}"
       )
-      zone.AvatarEvents ! AvatarServiceMessage(
+      zone.AvatarEvents ! MessageEnvelope(
         zone.id,
-        AvatarAction.PlanetsideAttribute(resourceSilo.GUID, 45, resourceSilo.CapacitorDisplay)
+        PlanetsideAttribute(resourceSilo.GUID, 45, resourceSilo.CapacitorDisplay)
       )
       building.Actor ! BuildingActor.MapUpdate()
     }
@@ -145,6 +155,7 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     * The silo will agree to offers until its nanite capacitor is completely full.
     */
   def HandleNtuOffer(sender: ActorRef, src: NtuContainer): Unit = {
+    //todo if I want to test conditions towards continuing ntu transfers, do those here
     sender ! (if (resourceSilo.NtuCapacitor < resourceSilo.MaxNtuCapacitor) {
       Ntu.Request(0, resourceSilo.MaxNtuCapacitor - resourceSilo.NtuCapacitor)
     } else {
@@ -170,7 +181,7 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     */
   def HandleNtuRequest(sender: ActorRef, min: Float, max: Float): Unit = {
     val originalAmount = resourceSilo.NtuCapacitor
-    UpdateChargeLevel(-min)
+    UpdateChargeLevel(-min * drainMultiplier)
     sender ! Ntu.Grant(resourceSilo, originalAmount - resourceSilo.NtuCapacitor)
   }
 
@@ -181,6 +192,29 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     if (amount != 0) {
       panelAnimationFunc(sender, amount)
       panelAnimationFunc = SkipPanelAnimation
+      (src match {
+        case v: Vehicle => Some(v)
+        case _ => None
+      })
+        .map { v => (v, v.Owners) }
+        .collect { case (vehicle, Some(owner)) =>
+          //experience is reported as normal
+          val deposit: Long =
+            (Config.app.game.experience.sep.ntuSiloDepositReward.toFloat *
+              amount * resourceSilo.Definition.ChargeTime.toSeconds.toFloat / resourceSilo.MaxNtuCapacitor
+              ).toLong
+          vehicle.Zone.AvatarEvents ! BundledEnvelope(
+            MessageEnvelope(
+              owner.name,
+              AvatarAction.AwardBep(owner.charId, deposit, ExperienceType.Normal)
+            ),
+            MessageEnvelope(
+              owner.name,
+              AvatarAction.ShareAntExperienceWithSquad(owner, deposit, vehicle)
+            )
+          )
+          zones.exp.ToDatabase.reportNtuActivity(owner.charId, resourceSilo.Zone.Number, resourceSilo.Owner.GUID.guid, deposit)
+        }
     }
   }
 
@@ -192,6 +226,7 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     * @param trigger if positive, activate the animation;
     *                if negative or zero, disable the animation
     */
+  //noinspection ScalaUnusedSymbol
   def PanelAnimation(source: ActorRef, trigger: Float): Unit = {
     val currentlyHas = resourceSilo.NtuCapacitor
     // do not let the trigger charge go to waste, but also do not let the silo be filled
@@ -199,9 +234,9 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     val amount = (if (trigger > 0) {
       // panel glow & orb particles on
       val zone = resourceSilo.Zone
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zone.id,
-        VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, resourceSilo.GUID, 49, 1)
+        PlanetsideAttribute(resourceSilo.GUID, 49, 1)
       )
       math.min(resourceSilo.MaxNtuCapacitor - currentlyHas, trigger)
     } else if (trigger < 0) {
@@ -210,9 +245,9 @@ class ResourceSiloControl(resourceSilo: ResourceSilo)
     } else {
       // panel glow & orb particles off
       val zone = resourceSilo.Zone
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zone.id,
-        VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, resourceSilo.GUID, 49, 0)
+        PlanetsideAttribute(resourceSilo.GUID, 49, 0)
       )
       0
     }) * 0.9f

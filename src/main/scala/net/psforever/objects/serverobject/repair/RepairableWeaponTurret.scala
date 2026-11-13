@@ -5,8 +5,8 @@ import net.psforever.objects.Tool
 import net.psforever.objects.equipment.EquipmentSlot
 import net.psforever.objects.serverobject.turret.WeaponTurret
 import net.psforever.objects.vehicles.MountedWeapons
-import net.psforever.services.Service
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.vehicle.VehicleAction
 
 /**
   * The "control" `Actor` mixin for repair-handling code for `WeaponTurret` objects.
@@ -16,6 +16,7 @@ trait RepairableWeaponTurret extends RepairableEntity {
 
   override def Restoration(target: Repairable.Target): Unit = {
     super.Restoration(target)
+    RepairableAmenity.RestorationOfHistory(target)
     RepairableWeaponTurret.Restoration(RepairableObject)
   }
 }
@@ -27,10 +28,9 @@ object RepairableWeaponTurret {
     * and may have been concealed/deleted when the target was destroyed.
     * @see `MountedWeapons`
     * @see `MountedWeapons.Weapons`
-    * @see `Service.defaultPlayerGUID`
+    * @see `Default.GUID0`
     * @see `WeaponTurret`
-    * @see `VehicleAction.EquipmentInSlot`
-    * @see `VehicleServiceMessage`
+    * @see `EquipmentInSlot`
     * @see `Zone.VehicleEvents`
     * @param target the entity being destroyed;
     *               note: `MountedWeapons` is a parent of `WeaponTurret`
@@ -41,14 +41,15 @@ object RepairableWeaponTurret {
     val zoneId = zone.id
     val tguid  = target.GUID
     val events = zone.VehicleEvents
-    target.Weapons
+    events ! BundledEnvelope(target.Weapons
       .map({ case (index, slot: EquipmentSlot) => (index, slot.Equipment) })
       .collect {
         case (index: Int, Some(tool: Tool)) =>
-          events ! VehicleServiceMessage(
+          MessageEnvelope(
             zoneId,
-            VehicleAction.EquipmentInSlot(Service.defaultPlayerGUID, tguid, index, tool)
+            VehicleAction.EquipmentInSlot(tguid, index, tool)
           )
       }
+    )
   }
 }

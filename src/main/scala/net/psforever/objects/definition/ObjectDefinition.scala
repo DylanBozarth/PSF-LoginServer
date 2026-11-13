@@ -5,6 +5,7 @@ import net.psforever.objects.PlanetSideGameObject
 import net.psforever.objects.definition.converter.{ObjectCreateConverter, PacketConverter}
 import net.psforever.objects.geometry.GeometryForm
 import net.psforever.objects.geometry.d3.VolumetricGeometry
+import net.psforever.objects.serverobject.deploy.{Interference, InterferenceRange}
 import net.psforever.types.OxygenState
 
 /**
@@ -20,12 +21,22 @@ import net.psforever.types.OxygenState
   * So long as it is an `ObjectCreatePacket`, those methods can be called correctly for a game object of the desired type.
   * @param objectId the object's identifier number
   */
-abstract class ObjectDefinition(private val objectId: Int) extends BasicDefinition {
+abstract class ObjectDefinition(private val objectId: Int)
+  extends BasicDefinition {
   var registerAs: String = "generic"
 
   /** a data converter for this type of object */
   protected var packet: PacketConverter = new ObjectCreateConverter[PlanetSideGameObject]() {}
   Name = "object_definition"
+
+  private var useRadius: Float = 0f
+
+  def UseRadius: Float = useRadius
+
+  def UseRadius_=(radius: Float): Float = {
+    useRadius = radius
+    UseRadius
+  }
 
   /**
     * Get the conversion object.
@@ -110,6 +121,11 @@ abstract class ObjectDefinition(private val objectId: Int) extends BasicDefiniti
     * and it does not factor in the afterburner.
     */
   var maxForwardSpeed: Float = 0f
+
+  /**
+   * na
+   */
+  var interference: InterferenceRange = Interference.AllowAll
 
   def ObjectId: Int = objectId
 }

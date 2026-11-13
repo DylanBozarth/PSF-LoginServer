@@ -4,7 +4,8 @@ package game
 import net.psforever.types.{MeritCommendation, PlanetSideGUID}
 import org.specs2.mutable._
 import net.psforever.packet._
-import net.psforever.packet.game._
+import net.psforever.packet.game.packets._
+import net.psforever.packet.game.packets.{DisplayedAwardMessage, RibbonBarSlot}
 import scodec.bits._
 
 class DisplayedAwardMessageTest extends Specification {
@@ -15,14 +16,14 @@ class DisplayedAwardMessageTest extends Specification {
       case DisplayedAwardMessage(player_guid, ribbon, bar) =>
         player_guid mustEqual PlanetSideGUID(1695)
         ribbon mustEqual MeritCommendation.TwoYearVS
-        bar mustEqual RibbonBarsSlot.TermOfService
+        bar mustEqual RibbonBarSlot.TermOfService
       case _ =>
         ko
     }
   }
 
   "encode" in {
-    val msg = DisplayedAwardMessage(PlanetSideGUID(1695), MeritCommendation.TwoYearVS, RibbonBarsSlot.TermOfService)
+    val msg = DisplayedAwardMessage(PlanetSideGUID(1695), MeritCommendation.TwoYearVS, RibbonBarSlot.TermOfService)
     val pkt = PacketCoding.encodePacket(msg).require.toByteVector
 
     pkt mustEqual string

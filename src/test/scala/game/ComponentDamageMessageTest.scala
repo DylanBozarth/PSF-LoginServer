@@ -3,7 +3,8 @@ package game
 
 import org.specs2.mutable._
 import net.psforever.packet._
-import net.psforever.packet.game._
+import net.psforever.packet.game.packets._
+import net.psforever.packet.game.packets.{ComponentDamageField, ComponentDamageMessage}
 import net.psforever.types.{PlanetSideGUID, SubsystemComponent}
 import scodec.bits._
 
@@ -65,4 +66,3 @@ class ComponentDamageMessageTest extends Specification {
     pkt mustEqual string_off
   }
 }
-

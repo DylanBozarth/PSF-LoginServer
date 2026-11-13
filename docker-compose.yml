@@ -1,7 +1,9 @@
-version: "3"
 services:
   loginserver:
-    image: mozilla/sbt
+    # Matches the JDK the Dockerfile builds with, so local runs and released builds share a
+    # collector. Keep this off JDK 8, whose default ParallelGC does stop-the-world full
+    # collections that can run into seconds and stall every connected client at once.
+    image: sbtscala/scala-sbt:eclipse-temurin-focal-11.0.17_8_1.8.2_2.13.10
     volumes:
       - .:/PSF-Loginserver:z
     working_dir: /PSF-Loginserver
@@ -19,7 +21,7 @@ services:
     ports:
       - 51010:8080
   db:
-    image: postgres
+    image: postgres:14
     ports:
       - 5432:5432
     environment:

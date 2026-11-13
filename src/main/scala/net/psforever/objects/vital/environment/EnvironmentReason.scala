@@ -1,17 +1,19 @@
 // Copyright (c) 2020 PSForever
 package net.psforever.objects.vital.environment
 
-import net.psforever.objects.ballistics.SourceEntry
 import net.psforever.objects.serverobject.environment.{EnvironmentAttribute, PieceOfEnvironment}
+import net.psforever.objects.sourcing.SourceEntry
 import net.psforever.objects.vital.base.{DamageReason, DamageResolution}
 import net.psforever.objects.vital.damage.DamageCalculations
 import net.psforever.objects.vital.prop.DamageProperties
 import net.psforever.objects.vital.resolution.{DamageAndResistance, DamageResistanceModel}
-import net.psforever.objects.vital.{NoResistanceSelection, SimpleResolutions, Vitality}
+import net.psforever.objects.vital.{NoResistanceSelection, SimpleResolutions}
+import net.psforever.objects.zones.interaction.InteractsWithZone
 
 /**
   * A wrapper for a "damage source" in damage calculations
   * that parameterizes information necessary to explain the environment being antagonistic.
+ *
   * @see `DamageCalculations`
   * @param body a representative of an element of the environment
   * @param against for the purposes of damage, what kind of target is being acted upon
@@ -40,11 +42,11 @@ object EnvironmentReason {
     * @param target the target being involved in this interaction
     * @return an `EnvironmentReason` object
     */
-  def apply(body: PieceOfEnvironment, target: Vitality): EnvironmentReason =
+  def apply(body: PieceOfEnvironment, target: InteractsWithZone): EnvironmentReason =
     EnvironmentReason(body, target.DamageModel.DamageUsing)
 
   /** variable, no resisting, quick and simple */
-  def drm(against: DamageCalculations.Selector) = new DamageResistanceModel {
+  def drm(against: DamageCalculations.Selector): DamageResistanceModel = new DamageResistanceModel {
     DamageUsing = against
     ResistUsing = NoResistanceSelection
     Model = SimpleResolutions.calculate

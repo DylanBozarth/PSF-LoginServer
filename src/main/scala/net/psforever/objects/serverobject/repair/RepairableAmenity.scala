@@ -3,7 +3,11 @@ package net.psforever.objects.serverobject.repair
 
 import net.psforever.objects.Tool
 import net.psforever.objects.serverobject.structures.Amenity
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.objects.sourcing.{SourceEntry, SourceWithHealthEntry}
+import net.psforever.objects.vital.{DamagingActivity, RepairFromEquipment, SpawningActivity}
+import net.psforever.packet.game.packets.PlanetsideAttributeMessage
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.SendResponse
 
 /**
   * The "control" `Actor` mixin for repair-handling code
@@ -23,10 +27,9 @@ trait RepairableAmenity extends RepairableEntity {
 object RepairableAmenity {
 
   /**
-    * A resotred `Amenity` target dispatches two messages to chance its model and operational states.
+    * A restored `Amenity` target dispatches two messages to chance its model and operational states.
     * These `PlanetSideAttributeMessage` attributes are the same as reported during zone load client configuration.
-    * @see `AvatarAction.PlanetsideAttributeToAll`
-    * @see `AvatarServiceMessage`
+    * @see `PlanetsideAttribute`
     * @see `Zone.AvatarEvents`
     * @param target the entity being destroyed
     */
@@ -35,7 +38,31 @@ object RepairableAmenity {
     val zoneId     = zone.id
     val events     = zone.AvatarEvents
     val targetGUID = target.GUID
-    events ! AvatarServiceMessage(zoneId, AvatarAction.PlanetsideAttributeToAll(targetGUID, 50, 0))
-    events ! AvatarServiceMessage(zoneId, AvatarAction.PlanetsideAttributeToAll(targetGUID, 51, 0))
+    events ! MessageEnvelope(
+      zoneId,
+      SendResponse(PlanetsideAttributeMessage(targetGUID, 50, 0), PlanetsideAttributeMessage(targetGUID, 51, 0))
+    )
+    RestorationOfHistory(target)
+  }
+
+  /**
+   * The vitality change history will be forgotten as this entity, once destroyed, has been rebuilt.
+   * For the purpose of inheritance of experience due to interaction,
+   * the users who made an effort to repair the entity in its resurgence.
+   * @param target na
+   */
+  def RestorationOfHistory(target: Repairable.Target): Unit = {
+    val list = target.ClearHistory()
+    val effort = list.slice(
+      list.lastIndexWhere {
+        case dam: DamagingActivity => dam.data.targetAfter.asInstanceOf[SourceWithHealthEntry].health == 0
+        case _                     => false
+      },
+      list.size
+    ).collect {
+      case entry: RepairFromEquipment => Some(entry.user)
+      case _                          => None
+    }.flatten.distinctBy(_.Name)
+    target.LogActivity(SpawningActivity(SourceEntry(target), target.Zone.Number, effort.headOption))
   }
 }

@@ -5,7 +5,7 @@ import com.typesafe.config.{Config => TypesafeConfig}
 import enumeratum.{Enum, EnumEntry}
 import enumeratum.values.{IntEnum, IntEnumEntry}
 import net.psforever.objects.avatar.{BattleRank, Certification, CommandRank}
-import net.psforever.packet.game.ServerType
+import net.psforever.packet.game.packets.ServerType
 import net.psforever.types.ChatMessageType
 import pureconfig.ConfigConvert.viaNonEmptyStringOpt
 import pureconfig.{ConfigConvert, ConfigSource}
@@ -25,12 +25,12 @@ object Config {
   }
 
   implicit def enumeratumIntConfigConvert[A <: IntEnumEntry](implicit
-      enum: IntEnum[A],
+      e: IntEnum[A],
       ct: ClassTag[A]
   ): ConfigConvert[A] =
     viaNonEmptyStringOpt[A](
       v =>
-        enum.values.toList.collectFirst {
+        e.values.toList.collectFirst {
           case e: ServerType if e.name == v            => e.asInstanceOf[A]
           case e: BattleRank if e.value.toString == v  => e.asInstanceOf[A]
           case e: CommandRank if e.value.toString == v => e.asInstanceOf[A]
@@ -40,13 +40,13 @@ object Config {
     )
 
   implicit def enumeratumConfigConvert[A <: EnumEntry](implicit
-      enum: Enum[A],
+      e: Enum[A],
       ct: ClassTag[A]
   ): ConfigConvert[A] =
     viaNonEmptyStringOpt[A](
       v =>
-        enum.values.toList.collectFirst {
-          case e if e.toString.toLowerCase == v.toLowerCase => e.asInstanceOf[A]
+        e.values.toList.collectFirst {
+          case e if e.toString.toLowerCase == v.toLowerCase => e
         },
       _.toString
     )
@@ -62,30 +62,29 @@ object Config {
   // Raw config object - prefer app when possible
   lazy val config: TypesafeConfig = source.config() match {
     case Right(config) => config
-    case Left(failures) => {
+    case Left(failures) =>
       logger.error("Loading config failed")
       failures.toList.foreach { failure =>
         logger.error(failure.toString)
       }
       sys.exit(1)
-    }
   }
 
   // Typed config object
   lazy val app: AppConfig = source.load[AppConfig] match {
     case Right(config) => config
-    case Left(failures) => {
+    case Left(failures) =>
       logger.error("Loading config failed")
       failures.toList.foreach { failure =>
         logger.error(failure.toString)
       }
       sys.exit(1)
-    }
   }
 }
 
 case class AppConfig(
     bind: String,
+    local: String,
     public: String,
     login: LoginConfig,
     world: WorldConfig,
@@ -106,6 +105,7 @@ case class LoginConfig(
 
 case class WorldConfig(
     port: Int,
+    ports: Seq[Int],
     serverName: String,
     serverType: ServerType
 )
@@ -132,14 +132,18 @@ case class AntiCheatConfig(
 
 case class NetworkConfig(
     session: SessionConfig,
-    middleware: MiddlewareConfig
+    middleware: MiddlewareConfig,
+    eventCaching: CachedMessagesConfig
 )
 
 case class MiddlewareConfig(
     packetBundlingDelay: FiniteDuration,
+    packetBundlingDelayMultiplier: Float,
+    packetBundlingDrainLimit: Int,
     inReorderTimeout: FiniteDuration,
     inSubslotMissingDelay: FiniteDuration,
-    inSubslotMissingAttempts: Int
+    inSubslotMissingAttempts: Int,
+    smpHistoryLength: Int
 )
 
 case class SessionConfig(
@@ -147,16 +151,37 @@ case class SessionConfig(
     outboundGraceTime: FiniteDuration
 )
 
+case class CachedMessagesConfig(
+    flushCacheDelay: Long, //milliseconds
+    flushCacheMaxDelay: Long, //milliseconds
+    messageTrafficThreshold: Long
+)
+
 case class GameConfig(
-    instantActionAms: Boolean,
+    instantAction: InstantActionConfig,
     amenityAutorepairRate: Float,
     amenityAutorepairDrainRate: Float,
-    bepRate: Double,
-    cepRate: Double,
     newAvatar: NewAvatar,
     hart: HartConfig,
     sharedMaxCooldown: Boolean,
-    baseCertifications: Seq[Certification]
+    sharedBfrCooldown: Boolean,
+    baseCertifications: Seq[Certification],
+    warpGates: WarpGateConfig,
+    cavernRotation: CavernRotationConfig,
+    virtualTraining: VirtualTrainingConfig,
+    savedMsg: SavedMessageEvents,
+    playerDraw: PlayerStateDrawSettings,
+    doorsCanBeOpenedByMedAppFromThisDistance: Float,
+    experience: Experience,
+    maxBattleRank: Int,
+    promotion: PromotionSystem,
+    facilityHackTime: FiniteDuration,
+    alert: DensityAlert
+)
+
+case class InstantActionConfig(
+    spawnOnAms: Boolean,
+    thirdParty: Boolean
 )
 
 case class NewAvatar(
@@ -171,6 +196,7 @@ case class HartConfig(
 
 case class DevelopmentConfig(
     unprivilegedGmCommands: Seq[ChatMessageType],
+    unprivilegedGmBangCommands: Seq[String],
     netSim: NetSimConfig
 )
 
@@ -189,4 +215,139 @@ case class KamonConfig(
 case class SentryConfig(
     enable: Boolean,
     dsn: String
+)
+
+case class WarpGateConfig(
+    defaultToSanctuaryDestination: Boolean,
+    broadcastBetweenConflictedFactions: Boolean
+)
+
+case class CavernRotationConfig(
+    hoursBetweenRotation: Float,
+    simultaneousUnlockedZones: Int,
+    enhancedRotationOrder: Seq[Int],
+    forceRotationImmediately: Boolean
+)
+
+case class VirtualTrainingConfig(
+    shootingRangeTargetsEnabled: Boolean,
+    maleBotNames: List[String],
+    femaleBotNames: List[String],
+    universalBotNames: List[String]
+)
+
+case class SavedMessageEvents(
+    short: SavedMessageTimings,
+    renewal: SavedMessageTimings,
+    interruptedByAction: SavedMessageTimings
+)
+
+case class SavedMessageTimings(
+    fixed: Long,
+    variable: Long
+)
+
+case class PlayerStateDrawSettings(
+    populationThreshold: Int,
+    populationStep: Int,
+    rangeMin: Int,
+    rangeMax: Int,
+    rangeStep: Int,
+    ranges: Seq[Int],
+    delayMax: Long,
+    delays: Seq[Long]
+) {
+  assert(ranges.nonEmpty)
+  assert(ranges.size == delays.size)
+}
+
+case class Experience(
+    shortContributionTime: Long,
+    longContributionTime: Long,
+    bep: BattleExperiencePoints,
+    sep: SupportExperiencePoints,
+    cep: CommandExperiencePoints,
+    facilityCaptureRate: Float
+) {
+  assert(shortContributionTime < longContributionTime)
+}
+
+case class ThreatAssessment(
+    id: Int,
+    value: Float
+)
+
+case class ThreatLevel(
+    id: Int,
+    level: Long
+)
+
+case class BattleExperiencePoints(
+    rate: Float,
+    base: BattleExperiencePointsBase,
+    lifeSpan: BattleExperiencePointsLifespan,
+    revenge: BattleExperiencePointsRevenge
+)
+
+case class BattleExperiencePointsBase(
+    bopsMultiplier: Long,
+    asMax: Long,
+    withKills: Long,
+    asMounted: Long,
+    mature: Long,
+    maturityTime: Long
+)
+
+case class BattleExperiencePointsLifespan(
+    lifeSpanThreatRate: Float,
+    threatAssessmentOf: List[ThreatAssessment],
+    maxThreatLevel: List[ThreatLevel]
+)
+
+case class BattleExperiencePointsRevenge(
+    rate: Float,
+    defaultExperience: Long,
+    maxExperience: Long
+)
+
+case class SupportExperiencePoints(
+    rate: Float,
+    ntuSiloDepositReward: Long,
+    canNotFindEventDefaultValue: Long,
+    events: Seq[SupportExperienceEvent]
+)
+
+case class SupportExperienceEvent(
+    name: String,
+    base: Long,
+    shotsMax: Int = 50,
+    shotsCutoff: Int = 50,
+    shotsMultiplier: Float = 0f,
+    amountMultiplier: Float = 0f
+)
+
+case class CommandExperiencePoints(
+    rate: Float,
+    lluCarrierModifier: Float,
+    lluSlayerCreditDuration: Duration,
+    lluSlayerCredit: Long,
+    maximumPerSquadSize: Seq[Int],
+    squadSizeLimitOverflow: Int,
+    squadSizeLimitOverflowMultiplier: Float
+)
+
+case class PromotionSystem(
+    active: Boolean,
+    broadcastBattleRank: Int,
+    resetBattleRank: Int,
+    maxBattleRank: Int,
+    battleExperiencePointsModifier: Float,
+    supportExperiencePointsModifier: Float,
+    captureExperiencePointsModifier: Float
+)
+
+case class DensityAlert(
+    yellow: Int,
+    orange: Int,
+    red: Int
 )

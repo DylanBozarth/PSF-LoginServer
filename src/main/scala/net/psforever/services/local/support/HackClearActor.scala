@@ -2,16 +2,43 @@
 package net.psforever.services.local.support
 
 import java.util.concurrent.TimeUnit
-
-import akka.actor.{Actor, Cancellable}
-import net.psforever.objects.Default
+import akka.actor.{Actor, ActorContext, ActorRef, Cancellable, Props}
+import net.psforever.objects.{Default, GlobalDefinitions}
 import net.psforever.objects.serverobject.hackable.Hackable
 import net.psforever.objects.serverobject.{CommonMessages, PlanetSideServerObject}
 import net.psforever.objects.zones.Zone
+import net.psforever.packet.game.packets.HackState7
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.base.{EventServiceSupport, GenericSupportEnvelope, GenericSupportEnvelopeOnly}
+import net.psforever.services.base.message.GenericObjectAction
+import net.psforever.services.local.LocalAction.IsAHackMessage
+import net.psforever.services.local.LocalAction
 import net.psforever.types.PlanetSideGUID
 
 import scala.annotation.tailrec
 import scala.concurrent.duration._
+
+case object HackClearSupport
+  extends EventServiceSupport {
+  def label: String = "hackClearer"
+  def constructor(context: ActorContext): ActorRef = {
+    context.actorOf(Props[HackClearActor](), name = "HackClearer")
+  }
+}
+
+final case class HackEntityEnvelope(
+                                     channel: String,
+                                     filter: PlanetSideGUID,
+                                     msg: IsAHackMessage,
+                                     supportMessage: Any
+                                   ) extends GenericSupportEnvelope {
+  def supportLabel: String = "hackClearer"
+}
+
+final case class HackClearEnvelope(supportMessage: Any)
+  extends GenericSupportEnvelopeOnly {
+  def supportLabel: String = "hackClearer"
+}
 
 /**
   * Restore original functionality to an object that has been hacked after a certain amount of time has passed.
@@ -29,41 +56,43 @@ class HackClearActor() extends Actor {
 
   def receive: Receive = {
     case HackClearActor.ObjectIsHacked(target, zone, unk1, unk2, duration, time) =>
-      val durationNanos = TimeUnit.NANOSECONDS.convert(duration, TimeUnit.SECONDS)
-      hackedObjects = hackedObjects :+ HackClearActor.HackEntry(target, zone, unk1, unk2, time, durationNanos)
-
+      val durationMillis = TimeUnit.MILLISECONDS.convert(duration, TimeUnit.SECONDS)
+      val newEntry = HackClearActor.HackEntry(target, zone, unk1, unk2, time, durationMillis)
+      // Remove any existing entry for this GUID + zone in case of virus adding an entry for same target
+      hackedObjects = hackedObjects.filterNot(e => e.target.GUID == target.GUID && e.zone.id == zone.id)
+      hackedObjects = newEntry :: hackedObjects
+      // Sort so they are removed in the correct order
+      hackedObjects = hackedObjects.sortBy(e => e.time + e.duration)
       // Restart the timer, in case this is the first object in the hacked objects list
       RestartTimer()
 
     case HackClearActor.TryClearHacks() =>
       clearTrigger.cancel()
-      val now: Long = System.nanoTime
+      val now: Long = System.currentTimeMillis()
       //TODO we can just walk across the list of doors and extract only the first few entries
       val (unhackObjects, stillHackedObjects) = PartitionEntries(hackedObjects, now)
       hackedObjects = stillHackedObjects
-      unhackObjects.foreach(entry => {
-        entry.target.Actor ! CommonMessages.ClearHack()
-        context.parent ! HackClearActor.SendHackMessageHackCleared(
-          entry.target.GUID,
-          entry.zone.id,
-          entry.unk1,
-          entry.unk2
-        ) //call up to the main event system
-      })
+      unhackObjects
+        .map { case HackClearActor.HackEntry(target, zone, unk1, unk2, _, _) =>
+          target.Actor ! CommonMessages.ClearHack()
+          if (target.Definition == GlobalDefinitions.main_terminal) {
+            ClearVirusFromBuilding(target)
+          }
+          (zone, MessageEnvelope(zone.id, LocalAction.HackClear(target.GUID, unk1, unk2)))
+        }
+        .groupBy(_._1)
+        .foreach { case (zone, list) =>
+          zone.LocalEvents ! BundledEnvelope(list.map(_._2))
+        }
 
       RestartTimer()
 
     case HackClearActor.ObjectIsResecured(target) =>
       hackedObjects.find { _.target == target } match {
-        case Some(entry: HackClearActor.HackEntry) =>
+        case Some(HackClearActor.HackEntry(target, zone, unk1, unk2, _, _)) =>
           hackedObjects = hackedObjects.filterNot(x => x.target == target)
-          entry.target.Actor ! CommonMessages.ClearHack()
-          context.parent ! HackClearActor.SendHackMessageHackCleared(
-            entry.target.GUID,
-            entry.zone.id,
-            entry.unk1,
-            entry.unk2
-          ) //call up to the main event system
+          target.Actor ! CommonMessages.ClearHack()
+          zone.LocalEvents ! MessageEnvelope(zone.id, LocalAction.HackClear(target.GUID, 3212836864L, HackState7.Unk8))
 
           // Restart the timer in case the object we just removed was the next one scheduled
           RestartTimer()
@@ -75,12 +104,12 @@ class HackClearActor() extends Actor {
 
   private def RestartTimer(): Unit = {
     if (hackedObjects.nonEmpty) {
-      val now                                 = System.nanoTime()
+      val now                                 = System.currentTimeMillis()
       val (_/*unhackObjects*/, stillHackedObjects) = PartitionEntries(hackedObjects, now)
 
       stillHackedObjects.headOption match {
         case Some(hackEntry) =>
-          val short_timeout: FiniteDuration = math.max(1, hackEntry.duration - (now - hackEntry.time)) nanoseconds
+          val short_timeout: FiniteDuration = math.max(1, hackEntry.duration - (now - hackEntry.time)).milliseconds
 
           log.debug(
             s"HackClearActor: still items left in hacked objects list. Checking again in ${short_timeout.toSeconds} seconds"
@@ -94,6 +123,25 @@ class HackClearActor() extends Actor {
   }
 
   /**
+    * When the hack timer expires on a main_terminal, clear the virus from the building and
+    * inform the players in the area
+    * @param target main_terminal object
+    */
+  private def ClearVirusFromBuilding(target: PlanetSideServerObject): Unit = {
+    import net.psforever.objects.serverobject.structures.Building
+    import net.psforever.objects.serverobject.terminals.Terminal
+    import net.psforever.actors.zone.BuildingActor
+
+    val building = target.asInstanceOf[Terminal].Owner.asInstanceOf[Building]
+    building.virusId = 8
+    building.virusInstalledBy = None
+    val msg = GenericObjectAction(target.GUID, 60)
+    val events = building.Zone.AvatarEvents
+    events ! BundledEnvelope(building.PlayersInSOI.map { player => MessageEnvelope(player.Name, msg) })
+    building.Actor ! BuildingActor.MapUpdate()
+  }
+
+  /**
     * Iterate over entries in a `List` until an entry that does not exceed the time limit is discovered.
     * Separate the original `List` into two:
     * a `List` of elements that have exceeded the time limit,
@@ -102,7 +150,7 @@ class HackClearActor() extends Actor {
     * and newer entries are always added to the end of the main `List`,
     * processing in order is always correct.
     * @param list the `List` of entries to divide
-    * @param now the time right now (in nanoseconds)
+    * @param now the time right now (in milliseconds)
     * @see `List.partition`
     * @return a `Tuple` of two `Lists`, whose qualifications are explained above
     */
@@ -119,7 +167,7 @@ class HackClearActor() extends Actor {
     * a `List` of elements that have exceeded the time limit,
     * and a `List` of elements that still satisfy the time limit.
     * @param iter the `Iterator` of entries to divide
-    * @param now the time right now (in nanoseconds)
+    * @param now the time right now (in milliseconds)
     * @param index a persistent record of the index where list division should occur;
     *              defaults to 0
     * @return the index where division will occur
@@ -156,9 +204,9 @@ object HackClearActor {
       target: PlanetSideServerObject,
       zone: Zone,
       unk1: Long,
-      unk2: Long,
+      unk2: HackState7,
       duration: Int,
-      time: Long = System.nanoTime()
+      time: Long = System.currentTimeMillis()
   )
 
   /**
@@ -172,7 +220,7 @@ object HackClearActor {
     * @param obj the server object
     * @param zone_id the zone in which the object resides
     */
-  final case class SendHackMessageHackCleared(obj: PlanetSideGUID, zone_id: String, unk1: Long, unk2: Long)
+  final case class SendHackMessageHackCleared(obj: PlanetSideGUID, zone_id: String, unk1: Long, unk2: HackState7)
 
   /**
     * Internal message used to signal a test of the queued door information.
@@ -185,14 +233,14 @@ object HackClearActor {
     * @param target the server object
     * @param zone the zone in which the object resides
     * @param time when the object was hacked
-    * @param duration The hack duration in nanoseconds
+    * @param duration The hack duration in milliseconds
     * @see `ObjectIsHacked`
     */
   private final case class HackEntry(
       target: PlanetSideServerObject,
       zone: Zone,
       unk1: Long,
-      unk2: Long,
+      unk2: HackState7,
       time: Long,
       duration: Long
   )

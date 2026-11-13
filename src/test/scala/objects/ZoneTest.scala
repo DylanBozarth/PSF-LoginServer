@@ -2,7 +2,6 @@
 package objects
 
 import java.util.concurrent.atomic.AtomicInteger
-
 import akka.actor.ActorContext
 import base.ActorTest
 import net.psforever.objects.entity.IdentifiableEntity
@@ -19,6 +18,7 @@ import net.psforever.objects.Vehicle
 import org.specs2.mutable.Specification
 import akka.actor.typed.scaladsl.adapter._
 import net.psforever.actors.zone.ZoneActor
+import net.psforever.actors.zone.building.FacilityLogic
 import net.psforever.objects.avatar.Avatar
 import net.psforever.services.ServiceManager
 
@@ -150,7 +150,7 @@ class ZoneActorTest extends ActorTest {
           "Building",
           buildingGuid = 1,
           mapId = 1,
-          FoundationBuilder(Building.Structure(StructureType.Building, Vector3(1, 1, 1)))
+          FoundationBuilder(Building.Structure(StructureType.Building, Vector3(1, 1, 1), Vector3.Zero, GlobalDefinitions.building, FacilityLogic))
         )
         addLocalObject(2, SpawnTube.Constructor(Vector3(1, 0, 0), Vector3.Zero))
         addLocalObject(3, Terminal.Constructor(Vector3.Zero, GlobalDefinitions.dropship_vehicle_terminal))
@@ -163,7 +163,7 @@ class ZoneActorTest extends ActorTest {
           "Building",
           buildingGuid = 5,
           mapId = 2,
-          FoundationBuilder(Building.Structure(StructureType.Building))
+          FoundationBuilder(Building.Structure(StructureType.Building, Vector3.Zero, Vector3.Zero, GlobalDefinitions.building, FacilityLogic))
         )
         addLocalObject(6, SpawnTube.Constructor(Vector3.Zero, Vector3.Zero))
         linkObjectToBuilding(6, 5)
@@ -172,7 +172,7 @@ class ZoneActorTest extends ActorTest {
           "Building",
           buildingGuid = 7,
           mapId = 3,
-          FoundationBuilder(Building.Structure(StructureType.Building, Vector3(1, 1, 1)))
+          FoundationBuilder(Building.Structure(StructureType.Building, Vector3(1, 1, 1), Vector3.Zero, GlobalDefinitions.building, FacilityLogic))
         )
         addLocalObject(8, Terminal.Constructor(Vector3.Zero, GlobalDefinitions.dropship_vehicle_terminal))
         addLocalObject(9, SpawnTube.Constructor(Vector3(1, 0, 0), Vector3.Zero))
@@ -226,7 +226,7 @@ class ZonePopulationTest extends ActorTest {
       assert(zone.Players.isEmpty)
       assert(zone.LivePlayers.isEmpty)
       zone.Population ! Zone.Population.Join(avatar)
-      zone.Population ! Zone.Population.Spawn(avatar, player, null)
+      zone.Population ! Zone.Population.Spawn(avatar, player, null, null)
       expectNoMessage(Duration.create(200, "ms"))
       assert(zone.Players.size == 1)
       assert(zone.Players.head == avatar)
@@ -243,12 +243,12 @@ class ZonePopulationTest extends ActorTest {
       zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
       receiveOne(Duration.create(200, "ms")) //consume
       zone.Population ! Zone.Population.Join(avatar)
-      zone.Population ! Zone.Population.Spawn(avatar, player, null)
+      zone.Population ! Zone.Population.Spawn(avatar, player, null, null)
       expectNoMessage(Duration.create(100, "ms"))
 
       assert(zone.Players.size == 1)
       assert(zone.Players.head == avatar)
-      zone.Population ! Zone.Population.Leave(avatar)
+      zone.Population ! Zone.Population.Leave(avatar, null)
       val reply = receiveOne(Duration.create(100, "ms"))
       assert(reply.isInstanceOf[Zone.Population.PlayerHasLeft])
       assert(zone.Players.isEmpty)
@@ -382,7 +382,7 @@ class ZonePopulationTest extends ActorTest {
       zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
       expectNoMessage(200 milliseconds)
       zone.Population ! Zone.Population.Join(avatar)
-      zone.Population ! Zone.Population.Spawn(avatar, player, null)
+      zone.Population ! Zone.Population.Spawn(avatar, player, null, null)
       expectNoMessage(Duration.create(100, "ms"))
 
       assert(zone.Players.size == 1)
@@ -486,9 +486,13 @@ class ZonePopulationTest extends ActorTest {
 class ZoneGroundDropItemTest extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
   hub.register(item, 10)
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub)
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -511,9 +515,13 @@ class ZoneGroundDropItemTest extends ActorTest {
 class ZoneGroundCanNotDropItem1Test extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
   //hub.register(item, 10) //!important
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub)
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -536,9 +544,13 @@ class ZoneGroundCanNotDropItem1Test extends ActorTest {
 class ZoneGroundCanNotDropItem2Test extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
-  hub.register(item, 10) //!important
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  //zone.GUID(hub) //!important
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    //GUID(hub) !important
+  }
+  hub.register(item, 10)
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -561,9 +573,13 @@ class ZoneGroundCanNotDropItem2Test extends ActorTest {
 class ZoneGroundCanNotDropItem3Test extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
-  hub.register(item, 10) //!important
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub) //!important
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
+  hub.register(item, 10)
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -594,9 +610,13 @@ class ZoneGroundCanNotDropItem3Test extends ActorTest {
 class ZoneGroundPickupItemTest extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
   hub.register(item, 10)
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub)
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -622,9 +642,13 @@ class ZoneGroundPickupItemTest extends ActorTest {
 class ZoneGroundCanNotPickupItemTest extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
   hub.register(item, 10)
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub) //still registered to this zone
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 
@@ -646,9 +670,13 @@ class ZoneGroundCanNotPickupItemTest extends ActorTest {
 class ZoneGroundRemoveItemTest extends ActorTest {
   val item = AmmoBox(GlobalDefinitions.bullet_9mm)
   val hub  = new NumberPoolHub(new MaxNumberSource(20))
+  val zone = new Zone(
+    "test",
+    new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools() = {}
+    GUID(hub)
+  }
   hub.register(item, 10)
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) { override def SetupNumberPools() = {} }
-  zone.GUID(hub) //still registered to this zone
   zone.actor = system.spawn(ZoneActor(zone), ZoneTest.TestName)
   expectNoMessage(200 milliseconds)
 

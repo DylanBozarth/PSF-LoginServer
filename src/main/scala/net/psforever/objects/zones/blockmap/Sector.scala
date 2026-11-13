@@ -7,6 +7,7 @@ import net.psforever.objects.equipment.Equipment
 import net.psforever.objects.serverobject.environment.PieceOfEnvironment
 import net.psforever.objects.serverobject.structures.{Amenity, Building}
 import net.psforever.objects.{Player, Vehicle}
+import net.psforever.objects.avatar.AvatarBot
 
 import scala.collection.mutable.ListBuffer
 
@@ -14,9 +15,13 @@ import scala.collection.mutable.ListBuffer
   * The collections of entities in a sector conglomerate.
   */
 trait SectorPopulation {
-  def range: Float
+  def rangeX: Float
+
+  def rangeY: Float
 
   def livePlayerList: List[Player]
+
+  def botList: List[AvatarBot]
 
   def corpseList: List[Player]
 
@@ -39,6 +44,7 @@ trait SectorPopulation {
     */
   def total: Int = {
     livePlayerList.size +
+    botList.size +
     corpseList.size +
     vehicleList.size +
     equipmentOnGroundList.size +
@@ -67,7 +73,7 @@ trait SectorTraits {
   * @param eqFunc a custom equivalence function to distinguish between the entities in the list
   * @tparam A the type of object that will be the entities stored in the list
   */
-class SectorListOf[A](eqFunc: (A, A) => Boolean = (a: A, b: A) => a equals b) {
+class SectorListOf[A](eqFunc: (A, A) => Boolean = (a: A, b: A) => a == b) {
   private val internalList: ListBuffer[A] = ListBuffer[A]()
 
   /**
@@ -118,11 +124,15 @@ class SectorListOf[A](eqFunc: (A, A) => Boolean = (a: A, b: A) => a equals b) {
 class Sector(val longitude: Int, val latitude: Int, val span: Int)
   extends SectorPopulation {
   private val livePlayers: SectorListOf[Player] = new SectorListOf[Player](
-    (a: Player, b: Player) => a.CharId == b.CharId
+    (a: Player, b: Player) => a.GUID == b.GUID
+  )
+
+  private val bots: SectorListOf[AvatarBot] = new SectorListOf[AvatarBot](
+    (a: AvatarBot, b: AvatarBot) => a.GUID == b.GUID
   )
 
   private val corpses: SectorListOf[Player] = new SectorListOf[Player](
-    (a: Player, b: Player) => a.GUID == b.GUID || (a eq b)
+    (a: Player, b: Player) => a eq b
   )
 
   private val vehicles: SectorListOf[Vehicle] = new SectorListOf[Vehicle](
@@ -138,11 +148,11 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
   )
 
   private val buildings: SectorListOf[Building] = new SectorListOf[Building](
-    (a: Building, b: Building) => a eq b
+    (a: Building, b: Building) => a.GUID == b.GUID
   )
 
   private val amenities: SectorListOf[Amenity] = new SectorListOf[Amenity](
-    (a: Amenity, b: Amenity) => a eq b
+    (a: Amenity, b: Amenity) => a.GUID == b.GUID
   )
 
   private val environment: SectorListOf[PieceOfEnvironment] = new SectorListOf[PieceOfEnvironment](
@@ -153,9 +163,13 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
     (a: Projectile, b: Projectile) => a.id == b.id
   )
 
-  def range: Float = span.toFloat
+  def rangeX: Float = span.toFloat
+
+  def rangeY: Float = span.toFloat
 
   def livePlayerList : List[Player] = livePlayers.list
+
+  def botList : List[AvatarBot] = bots.list
 
   def corpseList: List[Player] = corpses.list
 
@@ -181,16 +195,14 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
     */
   def addTo(o: BlockMapEntity): Boolean = {
     o match {
-      case p: Player =>
-        //players and corpses are the same kind of object, but are distinguished by a single flag
+      case p: Player if p.isBackpack =>
         //when adding to the "corpse" list, first attempt to remove from the "player" list
-        if (!p.isBackpack) {
-          livePlayers.list.size < livePlayers.addTo(p).size
-        }
-        else {
-          livePlayers.removeFrom(p)
-          corpses.list.size < corpses.addTo(p).size
-        }
+        livePlayers.removeFrom(p)
+        corpses.list.size < corpses.addTo(p).size
+      case p: Player =>
+        livePlayers.list.size < livePlayers.addTo(p).size
+      case ab: AvatarBot =>
+        bots.list.size < bots.addTo(ab).size
       case v: Vehicle =>
         vehicles.list.size < vehicles.addTo(v).size
       case e: Equipment =>
@@ -200,7 +212,11 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
       case b: Building =>
         buildings.list.size < buildings.addTo(b).size
       case a: Amenity =>
-        amenities.list.size < amenities.addTo(a).size
+        val added = amenities.list.size < amenities.addTo(a).size
+        if (added) {
+          a.Definition.environmentField.foreach(field => environment.addTo(field.create(a)))
+        }
+        added
       case e: PieceOfEnvironment =>
         environment.list.size < environment.addTo(e).size
       case p: Projectile =>
@@ -218,9 +234,12 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
     */
   def removeFrom(o: Any): Boolean = {
     o match {
-      case p: Player =>
-        livePlayers.list.size > livePlayers.removeFrom(p).size ||
+      case p: Player if p.isBackpack =>
         corpses.list.size > corpses.removeFrom(p).size
+      case p: Player =>
+        livePlayers.list.size > livePlayers.removeFrom(p).size
+      case ab: AvatarBot =>
+        bots.list.size > bots.removeFrom(ab).size
       case v: Vehicle =>
         vehicles.list.size > vehicles.removeFrom(v).size
       case e: Equipment =>
@@ -235,10 +254,20 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
   }
 }
 
+object Sector {
+  /**
+    * An sector that is empty forever.
+    */
+  final val Empty = new Sector(longitude = 0, latitude = 0, span = 0) {
+    override def addTo(o : BlockMapEntity): Boolean = false
+  }
+}
+
 /**
   * The specific datastructure that is mentioned when using the term "sector conglomerate".
   * Typically used to compose the lists of entities from various individual sectors.
   * @param livePlayerList the living players
+  * @param botList the bot avatars
   * @param corpseList the dead players
   * @param vehicleList vehicles
   * @param equipmentOnGroundList dropped equipment
@@ -247,21 +276,45 @@ class Sector(val longitude: Int, val latitude: Int, val span: Int)
   * @param amenityList the structures within the structures
   * @param environmentList fields that represent the game world environment
   */
+/**
+  * The entity lists are declared by-name and retained as `lazy val`s, so each category is
+  * condensed on first access and memoized thereafter.
+  * A sector group frequently spans a great many sectors while callers usually consult only one or
+  * two of the ten categories, and the group is rebuilt on hot paths such as the per-movement-packet
+  * local sector refresh, so condensing a category only when it is read keeps that cost proportional
+  * to what is actually used.
+  */
 class SectorGroup(
-                   val range: Float,
-                   val livePlayerList: List[Player],
-                   val corpseList: List[Player],
-                   val vehicleList: List[Vehicle],
-                   val equipmentOnGroundList: List[Equipment],
-                   val deployableList: List[Deployable],
-                   val buildingList: List[Building],
-                   val amenityList: List[Amenity],
-                   val environmentList: List[PieceOfEnvironment],
-                   val projectileList: List[Projectile]
+                   val rangeX: Float,
+                   val rangeY: Float,
+                   livePlayers: => List[Player],
+                   bots: => List[AvatarBot],
+                   corpses: => List[Player],
+                   vehicles: => List[Vehicle],
+                   equipmentOnGround: => List[Equipment],
+                   deployables: => List[Deployable],
+                   buildings: => List[Building],
+                   amenities: => List[Amenity],
+                   environment: => List[PieceOfEnvironment],
+                   projectiles: => List[Projectile]
                  )
-  extends SectorPopulation
+  extends SectorPopulation {
+  lazy val livePlayerList: List[Player] = livePlayers
+  lazy val botList: List[AvatarBot] = bots
+  lazy val corpseList: List[Player] = corpses
+  lazy val vehicleList: List[Vehicle] = vehicles
+  lazy val equipmentOnGroundList: List[Equipment] = equipmentOnGround
+  lazy val deployableList: List[Deployable] = deployables
+  lazy val buildingList: List[Building] = buildings
+  lazy val amenityList: List[Amenity] = amenities
+  lazy val environmentList: List[PieceOfEnvironment] = environment
+  lazy val projectileList: List[Projectile] = projectiles
+}
 
 object SectorGroup {
+  /** cached sector of no range and no entity coverage */
+  final val emptySector: SectorGroup = SectorGroup(range = 0, sectors = Nil)
+
   /**
     * Overloaded constructor that takes a single sector
     * and transfers the lists of entities into a single conglomeration of the sector populations.
@@ -269,18 +322,7 @@ object SectorGroup {
     * @return a `SectorGroup` object
     */
   def apply(sector: Sector): SectorGroup = {
-    new SectorGroup(
-      sector.range,
-      sector.livePlayerList,
-      sector.corpseList,
-      sector.vehicleList,
-      sector.equipmentOnGroundList,
-      sector.deployableList,
-      sector.buildingList,
-      sector.amenityList,
-      sector.environmentList,
-      sector.projectileList
-    )
+    SectorGroup(sector.rangeX, sector.rangeY, sector)
   }
 
   /**
@@ -291,9 +333,23 @@ object SectorGroup {
     * @return a `SectorGroup` object
     */
   def apply(range: Float, sector: Sector): SectorGroup = {
+    SectorGroup(range, range, sector)
+  }
+
+  /**
+    * Overloaded constructor that takes a single sector
+    * and transfers the lists of entities into a single conglomeration of the sector populations.
+    * @param rangeX a custom range value for the x-axis
+    * @param rangeY a custom range value for the y-axis
+    * @param sector the sector to be counted
+    * @return a `SectorGroup` object
+    */
+  def apply(rangeX: Float, rangeY: Float, sector: Sector): SectorGroup = {
     new SectorGroup(
-      range,
-      sector.livePlayerList,
+      rangeX,
+      rangeY,
+      sector.livePlayerList.filterNot(p => p.spectator || !p.allowInteraction),
+      sector.botList.filterNot(b => !b.allowInteraction),
       sector.corpseList,
       sector.vehicleList,
       sector.equipmentOnGroundList,
@@ -313,11 +369,11 @@ object SectorGroup {
     */
   def apply(sectors: Iterable[Sector]): SectorGroup = {
     if (sectors.isEmpty) {
-      SectorGroup(range = 0, sectors = Nil)
+      SectorGroup.emptySector
     } else if (sectors.size == 1) {
-      SectorGroup(sectors.head.range, sectors)
+      SectorGroup(sectors.head.rangeX, sectors.head.rangeY, sectors)
     } else {
-      SectorGroup(sectors.maxBy { _.range }.range, sectors)
+      SectorGroup(sectors.maxBy { _.rangeX }.rangeX, sectors.maxBy { _.rangeY }.rangeY, sectors)
     }
   }
 
@@ -329,13 +385,27 @@ object SectorGroup {
     * @return a `SectorGroup` object
     */
   def apply(range: Float, sectors: Iterable[Sector]): SectorGroup = {
+    SectorGroup(range, range, sectors)
+  }
+
+  /**
+    * Overloaded constructor that takes a group of sectors
+    * and condenses all of the lists of entities into a single conglomeration of the sector populations.
+    * @param rangeX a custom range value for the x-axis
+    * @param rangeY a custom range value for the y-axis
+    * @param sectors the series of sectors to be counted
+    * @return a `SectorGroup` object
+    */
+  def apply(rangeX: Float, rangeY: Float, sectors: Iterable[Sector]): SectorGroup = {
     if (sectors.isEmpty) {
-      new SectorGroup(range, Nil, Nil, Nil, Nil, Nil, Nil, Nil, Nil, Nil)
+      new SectorGroup(rangeX, rangeY, Nil, Nil, Nil, Nil, Nil, Nil, Nil, Nil, Nil, Nil)
     } else if (sectors.size == 1) {
       val sector = sectors.head
       new SectorGroup(
-        range,
-        sector.livePlayerList,
+        rangeX,
+        rangeY,
+        sector.livePlayerList.filterNot(p => p.spectator || !p.allowInteraction),
+        sector.botList.filterNot(b => !b.allowInteraction),
         sector.corpseList,
         sector.vehicleList,
         sector.equipmentOnGroundList,
@@ -347,8 +417,10 @@ object SectorGroup {
       )
     } else {
       new SectorGroup(
-        range,
-        sectors.flatMap { _.livePlayerList }.toList.distinct,
+        rangeX,
+        rangeY,
+        sectors.flatMap { _.livePlayerList }.toList.distinct.filterNot(p => p.spectator || !p.allowInteraction),
+        sectors.flatMap { _.botList }.toList.distinct.filterNot(b => !b.allowInteraction),
         sectors.flatMap { _.corpseList }.toList.distinct,
         sectors.flatMap { _.vehicleList }.toList.distinct,
         sectors.flatMap { _.equipmentOnGroundList }.toList.distinct,

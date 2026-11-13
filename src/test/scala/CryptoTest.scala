@@ -7,7 +7,7 @@ import org.specs2.mutable._
 import net.psforever.packet.PacketCoding
 import net.psforever.packet.PacketCoding.CryptoCoding
 import net.psforever.packet.control.{HandleGamePacket, SlottedMetaPacket}
-import net.psforever.packet.game.PlanetsideAttributeMessage
+import net.psforever.packet.game.packets.PlanetsideAttributeMessage
 import net.psforever.types.PlanetSideGUID
 import net.psforever.util.{DiffieHellman, Md5Mac}
 import org.bouncycastle.jce.provider.BouncyCastleProvider
@@ -66,7 +66,6 @@ class CryptoTest extends Specification {
         )
 
       val encrypted = PacketCoding.marshalPacket(packet, Some(10), Some(crypto)).require
-      println(s"encrypted ${encrypted}")
       val (decryptedPacket, sequence) = PacketCoding.unmarshalPacket(encrypted.bytes, Some(crypto)).require
 
       decryptedPacket mustEqual packet

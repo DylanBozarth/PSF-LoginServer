@@ -1,11 +1,15 @@
 //Copyright (c) 2020 PSForever
 package net.psforever.objects.serverobject.repair
 
+import net.psforever.objects.avatar.PlayerControl.sendResponse
+import net.psforever.objects.ce.DeployableCategory
+import net.psforever.objects.sourcing.PlayerSource
+import net.psforever.objects.vital.RepairFromEquipment
 import net.psforever.objects.{Player, Tool}
-import net.psforever.packet.game.{InventoryStateMessage, RepairMessage}
-import net.psforever.types.{PlanetSideEmpire, Vector3}
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.packet.game.packets.{ChatMsg, InventoryStateMessage, RepairMessage}
+import net.psforever.types.{ChatMessageType, PlanetSideEmpire, Vector3}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.{PlanetsideAttribute, SendResponse}
 
 /**
   * The "control" `Actor` mixin for repair-handling code,
@@ -54,7 +58,7 @@ trait RepairableEntity extends Repairable {
     */
   protected def CanPerformRepairs(target: Repairable.Target, player: Player, item: Tool): Boolean = {
     val definition = target.Definition
-    definition.Repairable && target.Health < definition.MaxHealth && (definition.RepairIfDestroyed || !target.Destroyed) &&
+    definition.Repairable && target.Health < target.MaxHealth && (definition.RepairIfDestroyed || !target.Destroyed) &&
     (target.Faction == player.Faction || target.Faction == PlanetSideEmpire.NEUTRAL) && item.Magazine > 0 &&
     player.isAlive && Vector3.Distance(target.Position, player.Position) < definition.RepairDistance
   }
@@ -63,13 +67,13 @@ trait RepairableEntity extends Repairable {
     * Calculate the health points change and enact that repair action if the targets are stationary.
     * Restore the target entity to a not destroyed state if applicable.
     * Always show the repair progress bar window by using the appropriate packet.
-    * @see `AvatarAction.PlanetsideAttributeToAll`
-    * @see `AvatarAction.SendResponse`
+    * @see `PlanetsideAttribute`
+    * @see `SendResponse`
     * @see `AvatarService`
     * @see `InventoryStateMessage`
     * @see `PlanetSideGameObject.isMoving`
     * @see `RepairMessage`
-    * @see `Service.defaultPlayerGUID`
+    * @see `Default.GUID0`
     * @see `Tool.Discharge`
     * @see `Zone.AvatarEvents`
     * @param target the entity being repaired
@@ -85,11 +89,15 @@ trait RepairableEntity extends Repairable {
       if (!(player.isMoving(test = 1f) || target.isMoving(test = 1f))) { //only allow stationary repairs within margin of error
         val repairValue = Repairable.applyLevelModifier(player, item, RepairToolValue(item)).toInt + target.Definition.RepairMod
         val magazine  = item.Discharge()
-        events ! AvatarServiceMessage(
+        events ! MessageEnvelope(
           player.Name,
-          AvatarAction.SendResponse(
-            Service.defaultPlayerGUID,
-            InventoryStateMessage(item.AmmoSlot.Box.GUID, item.GUID, magazine.toLong)
+          SendResponse(InventoryStateMessage(item.AmmoSlot.Box.GUID, item.GUID, magazine.toLong))
+        )
+        target.LogActivity(
+          RepairFromEquipment(
+            PlayerSource(player),
+            item.Definition,
+            repairValue
           )
         )
         PerformRepairs(target, repairValue)
@@ -97,13 +105,31 @@ trait RepairableEntity extends Repairable {
         originalHealth
       }
     //progress bar remains visible
-    events ! AvatarServiceMessage(
+    events ! MessageEnvelope(
       name,
-      AvatarAction.SendResponse(
-        Service.defaultPlayerGUID,
-        RepairMessage(target.GUID, updatedHealth * 100 / definition.MaxHealth)
-      )
+      SendResponse(RepairMessage(target.GUID, updatedHealth * 100 / definition.MaxHealth))
     )
+    //if vehicle and vehicle is owned by another player, send repair chat message to the vehicle's owner
+    if (target.Zone.Vehicles.exists(_.GUID == target.GUID)) {
+      val vehicle = target.Zone.Vehicles.filter(_.GUID == target.GUID).head
+      val vehicleOwner = vehicle.OwnerName.getOrElse("someone")
+      val amount = updatedHealth - originalHealth
+      if (vehicleOwner != "someone" && vehicle.OwnerGuid.get != player.GUID && amount > 0) {
+        val repairMessageOther = s"@YourWasHealedMessage^@${vehicle.Definition.Name}~^repaired~^$amount~^armor~^${player.Name}~"
+          sendResponse(vehicle.Zone, vehicleOwner, ChatMsg(ChatMessageType.UNK_227, repairMessageOther))
+      }
+    }
+    //same check for field turret
+    if (target.Zone.DeployableList.exists(_.GUID == target.GUID)) {
+      val turret = target.Zone.DeployableList.filter(_.GUID == target.GUID).head
+      val turretOwner = turret.OwnerName.getOrElse("someone")
+      val amount = updatedHealth - originalHealth
+      if (turret.Definition.DeployCategory == DeployableCategory.FieldTurrets && turretOwner != "someone"
+      && turret.OwnerGuid.get != player.GUID && amount > 0) {
+        val repairMessageOther = s"@YourWasHealedMessage^@${turret.Definition.Name}~^repaired~^$amount~^armor~^${player.Name}~"
+        sendResponse(turret.Zone, turretOwner, ChatMsg(ChatMessageType.UNK_227, repairMessageOther))
+      }
+    }
   }
 
   protected def PerformRepairs(target: Repairable.Target, amount: Int): Int = {
@@ -114,11 +140,11 @@ trait RepairableEntity extends Repairable {
     val newHealth = target.Health = target.Health + amount
     if (target.Destroyed) {
       if (newHealth >= target.Definition.RepairRestoresAt) {
-        events ! AvatarServiceMessage(zoneId, AvatarAction.PlanetsideAttributeToAll(tguid, 0, newHealth))
+        events ! MessageEnvelope(zoneId, PlanetsideAttribute(tguid, 0, newHealth))
         Restoration(target)
       }
     } else {
-      events ! AvatarServiceMessage(zoneId, AvatarAction.PlanetsideAttributeToAll(tguid, 0, newHealth))
+      events ! MessageEnvelope(zoneId, PlanetsideAttribute(tguid, 0, newHealth))
     }
     newHealth
   }

@@ -1,11 +1,11 @@
 // Copyright (c) 2021 PSForever
 package net.psforever.objects
 
-import net.psforever.objects.ballistics.SourceEntry
 import net.psforever.objects.definition.ObjectDefinition
 import net.psforever.objects.equipment.{EffectTarget, TargetValidation}
 import net.psforever.objects.serverobject.PlanetSideServerObject
 import net.psforever.objects.serverobject.affinity.FactionAffinity
+import net.psforever.objects.sourcing.SourceEntry
 import net.psforever.objects.vital.{Vitality, VitalityDefinition}
 import net.psforever.objects.vital.base.DamageType
 import net.psforever.objects.vital.etc.EmpReason
@@ -65,6 +65,108 @@ object SpecialEmp {
     innateDamage = emp
   }
 
+  final val cr3_emp = new DamageWithPosition {
+    CausesDamageType = DamageType.Splash
+    SympatheticExplosion = true
+    Damage0 = 0
+    DamageAtEdge = 1.0f
+    DamageRadius = 10f
+    AdditionalEffect = true
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Player,
+      EffectTarget.Validation.Player
+    ) -> 1000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.AMS
+    ) -> 5000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.MotionSensor
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.Spitfire
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Turret,
+      EffectTarget.Validation.Turret
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.VehicleNotAMS
+    ) -> 10000
+    Modifiers = MaxDistanceCutoff
+  }
+
+  final val cr4_emp = new DamageWithPosition {
+    CausesDamageType = DamageType.Splash
+    SympatheticExplosion = true
+    Damage0 = 0
+    DamageAtEdge = 1.0f
+    DamageRadius = 15f
+    AdditionalEffect = true
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Player,
+      EffectTarget.Validation.Player
+    ) -> 1000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.AMS
+    ) -> 5000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.MotionSensor
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.Spitfire
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Turret,
+      EffectTarget.Validation.Turret
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.VehicleNotAMS
+    ) -> 10000
+    Modifiers = MaxDistanceCutoff
+  }
+
+  final val cr5_emp = new DamageWithPosition {
+    CausesDamageType = DamageType.Splash
+    SympatheticExplosion = true
+    Damage0 = 0
+    DamageAtEdge = 1.0f
+    DamageRadius = 20f
+    AdditionalEffect = true
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Player,
+      EffectTarget.Validation.Player
+    ) -> 1000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.AMS
+    ) -> 5000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.MotionSensor
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Deployable,
+      EffectTarget.Validation.Spitfire
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Turret,
+      EffectTarget.Validation.Turret
+    ) -> 30000
+    JammedEffectDuration += TargetValidation(
+      EffectTarget.Category.Vehicle,
+      EffectTarget.Validation.VehicleNotAMS
+    ) -> 10000
+    Modifiers = MaxDistanceCutoff
+  }
+
   /**
     * Trigger an electromagnetic pulse.
     */
@@ -112,15 +214,14 @@ object SpecialEmp {
                      faction: PlanetSideEmpire.Value
                    ): (PlanetSideGameObject, PlanetSideGameObject, Float) => Boolean = {
     distanceCheck(new PlanetSideServerObject with OwnableByPlayer {
-      Owner = Some(owner.GUID)
-      OwnerName = owner match {
-        case p: Player          => p.Name
-        case o: OwnableByPlayer => o.OwnerName.getOrElse("")
-        case _                  => ""
+      owner match {
+        case p: Player          => AssignOwnership(p)
+        case o: OwnableByPlayer => AssignOwnership(o)
+        case _                  => OwnerGuid_=(Some(owner.GUID))
       }
       Position = position
-      def Faction = faction
-      def Definition = proxy_definition
+      def Faction: PlanetSideEmpire.Value = faction
+      def Definition: ObjectDefinition with VitalityDefinition = proxy_definition
     })
   }
 

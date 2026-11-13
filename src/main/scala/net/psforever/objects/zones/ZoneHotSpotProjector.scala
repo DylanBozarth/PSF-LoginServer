@@ -5,6 +5,8 @@ import akka.actor.{Actor, ActorRef, Cancellable, Props}
 import net.psforever.objects.Default
 import net.psforever.types.{PlanetSideEmpire, Vector3}
 import net.psforever.services.ServiceManager
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.galaxy.GalaxyAction
 
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration._
@@ -35,11 +37,11 @@ class ZoneHotSpotDisplay(
     dataList: ListBuffer[HotSpotInfo],
     dataBlanking: FiniteDuration
 ) extends Actor {
-  val projector = context.actorOf(
+  val projector: ActorRef = context.actorOf(
     Props(classOf[ZoneHotSpotProjector], zone, outputList, outputBlanking),
     s"${zone.id}-hotspot-projector"
   )
-  val backup =
+  val backup: ActorRef =
     context.actorOf(Props(classOf[ZoneHotSpotHistory], zone, dataList, dataBlanking), s"${zone.id}-hotspot-backup")
 
   def receive: Receive = {
@@ -73,6 +75,15 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
   var blankingDelay: FiniteDuration = blankingTime
 
   private[this] val log = org.log4s.getLogger(s"${zone.id.capitalize}HotSpotProjector")
+
+  /**
+   * Whether or not the debug command should actually add messages to the log at a debug level.
+   * @see `org.log4s.Debug`
+   * @param msg message to be appended
+   */
+  private def trace(msg: String): Unit = {
+    //log.trace(msg)
+  }
 
   /**
     * Actions that occur before this `Actor` is formally started.
@@ -152,30 +163,23 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
       blanking = context.system.scheduler.scheduleOnce(blankingDelay, self, ZoneHotSpotProjector.BlankingPhase())
 
     case Zone.HotSpot.Conflict(defender, attacker, location) =>
-      log.trace(s"received information about activity in ${zone.id}@$location")
+      trace(s"received information about activity in ${zone.id}@$location")
       val defenderFaction = defender.Faction
       val attackerFaction = attacker.Faction
       val noPriorHotSpots = hotspots.isEmpty
       val duration        = zone.HotSpotTimeFunction(defender, attacker)
-      if (duration.toNanos > 0) {
+      if (duration.toMillis > 0) {
         val hotspot = TryHotSpot(zone.HotSpotCoordinateFunction(location))
-        log.trace(
+        trace(
           s"updating activity status for ${zone.id} hotspot x=${hotspot.DisplayLocation.x} y=${hotspot.DisplayLocation.y}"
         )
         val noPriorActivity = !(hotspot.ActivityBy(defenderFaction) && hotspot.ActivityBy(attackerFaction))
         //update the activity report for these factions
-        val affectedFactions = Seq(attackerFaction, defenderFaction)
-        affectedFactions.foreach { f =>
-          hotspot.ActivityFor(f) match {
-            case Some(events) =>
-              events.Duration = duration
-              events.Report()
-            case None => ;
-          }
-        }
+        hotspot.Activity(attackerFaction).Report(pow = 2, duration)
+        hotspot.Activity(defenderFaction).Report(pow = 1, duration)
         //if the level of activity changed for one of the participants or the number of hotspots was zero
         if (noPriorActivity || noPriorHotSpots) {
-          UpdateHotSpots(affectedFactions, hotspots)
+          UpdateHotSpots(Seq(attackerFaction, defenderFaction), hotspots)
           if (noPriorHotSpots) {
             import scala.concurrent.ExecutionContext.Implicits.global
             blanking.cancel()
@@ -185,16 +189,16 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
       }
 
     case Zone.HotSpot.UpdateNow =>
-      log.trace(s"asked to update for zone ${zone.id} without a blanking period or new activity")
+      trace(s"asked to update for zone ${zone.id} without a blanking period or new activity")
       UpdateHotSpots(PlanetSideEmpire.values, hotspots)
 
     case ZoneHotSpotProjector.BlankingPhase() | Zone.HotSpot.Cleanup() =>
       blanking.cancel()
-      val curr: Long = System.nanoTime
+      val curr: Long = System.currentTimeMillis()
       //blanking dated activity reports
       val changed = hotspots.flatMap(spot => {
         spot.Activity.collect {
-          case (b, a: ActivityReport) if a.LastReport + a.Duration.toNanos <= curr =>
+          case (b, a: ActivityReport) if a.LastReport + a.Duration.toMillis <= curr =>
             a.Clear() //this faction has no more activity in this sector
             (b, spot)
         }
@@ -210,7 +214,7 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
       })
       val newSize      = spots.size
       val changesOnMap = hotspots.size - newSize
-      log.trace(s"blanking out $changesOnMap hotspots from zone ${zone.id}; $newSize remain active")
+      trace(s"blanking out $changesOnMap hotspots from zone ${zone.id}; $newSize remain active")
       hotspots.clear()
       hotspots.insertAll(0, spots)
       //other hotspots still need to be blanked later
@@ -225,7 +229,7 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
       }
 
     case Zone.HotSpot.ClearAll() =>
-      log.trace(s"blanking out all hotspots from zone ${zone.id} immediately")
+      trace(s"blanking out all hotspots from zone ${zone.id} immediately")
       blanking.cancel()
       hotspots.clear()
       UpdateHotSpots(PlanetSideEmpire.values, Nil)
@@ -266,7 +270,7 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
         report.Duration = 0L
       }
     }
-    log.trace(s"new duration remapping function provided; reloading ${hotspots.size} hotspots for one blanking phase")
+    trace(s"new duration remapping function provided; reloading ${hotspots.size} hotspots for one blanking phase")
   }
 
   /**
@@ -284,7 +288,7 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
       }
       newSpot
     }
-    log.trace(s"new coordinate remapping function provided; updating $redoneSpots.size hotspots")
+    trace(s"new coordinate remapping function provided; updating $redoneSpots.size hotspots")
     hotspots.clear()
     hotspots.insertAll(0, redoneSpots)
   }
@@ -301,12 +305,13 @@ class ZoneHotSpotProjector(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanki
   def UpdateHotSpots(affectedFactions: Iterable[PlanetSideEmpire.Value], hotSpotInfos: Iterable[HotSpotInfo]): Unit = {
     val zoneNumber      = zone.Number
     val hotSpotInfoList = hotSpotInfos.toList
-    affectedFactions.foreach(faction =>
-      galaxy ! Zone.HotSpot.Update(
-        faction,
-        zoneNumber,
-        1,
-        ZoneHotSpotProjector.SpecificHotSpotInfo(faction, hotSpotInfoList)
+    galaxy ! BundledEnvelope(
+      affectedFactions.map(faction =>
+        MessageEnvelope(faction.toString, GalaxyAction.HotSpotUpdate(
+          zoneNumber,
+          1,
+          ZoneHotSpotProjector.SpecificHotSpotInfo(faction, hotSpotInfoList)
+        ))
       )
     )
   }
@@ -331,9 +336,44 @@ class ZoneHotSpotHistory(zone: Zone, hotspots: ListBuffer[HotSpotInfo], blanking
   /* this component does not actually the visible hotspots
    * a duplicate of the projector device otherwise */
   override def UpdateHotSpots(
-      affectedFactions: Iterable[PlanetSideEmpire.Value],
-      hotSpotInfos: Iterable[HotSpotInfo]
-  ): Unit = {}
+                               affectedFactions: Iterable[PlanetSideEmpire.Value],
+                               hotSpotInfos: Iterable[HotSpotInfo]
+                             ): Unit = { }
+  override def Established: Receive = {
+    case ZoneHotSpotProjector.ExposeHeatForRegion(center, radius) =>
+      MapInfo.values.find(_.value == zone.map.name) match {
+        case Some(mapInfo) if mapInfo.hotSpotSpan > 0 =>
+          //turn the radius into the number of hotspots, then sample all hotspots outwards from the center region
+          val span = mapInfo.hotSpotSpan
+          val spanIntervalsHalf = (radius / span).toInt + 1
+          val cornerOffset = span * spanIntervalsHalf.toFloat
+          val lowerLeftCorner = zone.HotSpotCoordinateFunction(center) + Vector3(-cornerOffset, -cornerOffset, 0f)
+          val progressionOfIntervals = 0 to spanIntervalsHalf * 2
+          val squareRadius = radius * radius
+          val out = progressionOfIntervals
+            .flatMap { y =>
+              val yFloat = span * y.toFloat
+              progressionOfIntervals.map { x =>
+                hotspots.find { _.DisplayLocation == lowerLeftCorner + Vector3(span * x.toFloat, yFloat, 0f) }
+              }
+            }
+            .flatten
+            .filter { info => Vector3.DistanceSquared(center, info.DisplayLocation) < squareRadius }
+            .distinctBy { _.DisplayLocation }
+            .toList
+          sender() ! ZoneHotSpotProjector.ExposedHeat(center, radius, out)
+
+        case _ =>
+          //can't validate the radius so just get the center hotspot
+          sender() ! ZoneHotSpotProjector.ExposedHeat(
+            center,
+            radius,
+            List(TryHotSpot(zone.HotSpotCoordinateFunction(center)))
+          )
+      }
+    case msg =>
+      super.Established.apply(msg)
+  }
 }
 
 object ZoneHotSpotProjector {
@@ -352,6 +392,10 @@ object ZoneHotSpotProjector {
     * The internal message for eliminating hotspot data whose lifespan has exceeded its set duration.
     */
   private case class BlankingPhase()
+
+  final case class ExposeHeatForRegion(center: Vector3, radius: Float)
+
+  final case class ExposedHeat(center: Vector3, radius: Float, activity: List[HotSpotInfo])
 
   /**
     * Extract related hotspot activity information based on association with a faction.

@@ -1,12 +1,15 @@
 package net.psforever.actors.net
 
+import akka.actor.typed.receptionist.Receptionist
+
 import java.net.{InetAddress, InetSocketAddress}
 import akka.actor.{Actor, ActorRef, Cancellable, MDCContextAware, typed}
+import akka.actor.typed.scaladsl.adapter._
 import com.github.t3hnar.bcrypt._
 import net.psforever.objects.{Account, Default}
 import net.psforever.packet.PlanetSideGamePacket
-import net.psforever.packet.game.LoginRespMessage.{LoginError, StationError, StationSubscriptionStatus}
-import net.psforever.packet.game._
+import net.psforever.packet.game.packets.LoginRespMessage.{LoginError, StationError, StationSubscriptionStatus}
+import net.psforever.packet.game.packets.{ConnectToWorldMessage, ConnectToWorldRequestMessage, LoginMessage, LoginRespMessage, VNLWorldStatusMessage, WorldConnectionInfo, WorldInformation, WorldStatus}
 import net.psforever.persistence
 import net.psforever.services.ServiceManager
 import net.psforever.services.ServiceManager.Lookup
@@ -15,111 +18,219 @@ import net.psforever.types.PlanetSideEmpire
 import net.psforever.util.Config
 import net.psforever.util.Database._
 
+import java.security.MessageDigest
+import org.joda.time.LocalDateTime
+
+import scala.collection.mutable
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.util.{Failure, Success}
-/*
-object LoginActor {
-  def apply(
-      middlewareActor: typed.ActorRef[MiddlewareActor.Command],
-      uuid: String
-  ): Behavior[Command] =
-    Behaviors.setup(context => new LoginActor(context, middlewareActor, uuid).start())
 
+object LoginActor {
   sealed trait Command
 
-}
+  private case object UpdateServerList extends Command
 
-class LoginActor(
-    middlewareActor: typed.ActorRef[MiddlewareActor.Command],
-    uuid: String
-) {
+  final case class ReceptionistListing(listing: Receptionist.Listing) extends Command
 
-  def start(): Unit = {
-    Behaviors.receiveMessagePartial {}
+  private val gameTestServerAddressLocal = new InetSocketAddress(InetAddress.getByName(Config.app.local), Config.app.world.port)
+  private val gameTestServerAddressPublic = new InetSocketAddress(InetAddress.getByName(Config.app.public), Config.app.world.port)
+  private val localHostAddress = new InetSocketAddress("127.0.0.1", Config.app.world.port)
+
+  /**
+   * What does a token do?
+   * No one knows.
+   * @return a 32-bit ascii string
+   */
+  private def generateToken(): String = {
+    val r = new scala.util.Random
+    val sb = new mutable.StringBuilder
+    for (_ <- 1 to 31) {
+      sb.append(r.nextPrintableChar())
+    }
+    sb.toString
+  }
+
+  /**
+   * Generates a new password from username and password combination,
+   * hashing the initial password when salted by the username,
+   * mimicking the process the launcher follows.
+   * @param username part of the original details
+   * @param password part of the original details
+   * @param rounds number of times cryptographic mutation occurs
+   * @return new password
+   */
+  private def generateNewPassword(username: String, password: String, rounds: Int): String = {
+    // salt password hash with username (like the launcher does) (username + password)
+    val saltedPassword = username.concat(password)
+    // https://stackoverflow.com/a/46332228
+    // hash password (like the launcher sends)
+    val hashedPassword = MessageDigest.getInstance("SHA-256")
+      .digest(saltedPassword.getBytes("UTF-8"))
+      .map("%02x".format(_)).mkString
+    // bcrypt hash for DB storage
+    val bcryptedPassword = hashedPassword.bcryptBounded(rounds)
+    bcryptedPassword
+  }
+
+  /**
+   * Remove flavor from the server name that should not show up in the log.
+   * @param name original name
+   * @return sanitized name
+   */
+  private def sanitizeServerName(name: String): String = {
+    //remove color codes from the server name - look for '\\#' followed by six characters or numbers
+    name.replaceAll("\\\\#[\\da-fA-F]{6}","")
+  }
+
+  /**
+   * Selects the appropriate host address for transfer to world server.
+   * This is a workaround for cases of local connections not working
+   * properly when using a router that lacks Hairpin NAT support.
+   * @param ipAddress the IP address of the connecting client in string form
+   * @return the appropriate host address
+   */
+  private def selectHostAddress(ipAddress: String): InetSocketAddress = {
+    val address = InetAddress.getByName(ipAddress)
+    if (address.isLoopbackAddress()) {
+      localHostAddress
+    }
+    else if (address.isSiteLocalAddress()) {
+      gameTestServerAddressLocal
+    }
+    else {
+      gameTestServerAddressPublic
+    }
   }
 }
-
- */
 
 class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], connectionId: String, sessionId: Long)
     extends Actor
     with MDCContextAware {
-  private[this] val log = org.log4s.getLogger
-
   import scala.concurrent.ExecutionContext.Implicits.global
 
-  private case class UpdateServerList()
+  private var accountIntermediary: ActorRef = Default.Actor
+  private var sockets: typed.ActorRef[SocketPane.Command] = Default.typed.Actor
 
-  val usernameRegex = """[A-Za-z0-9]{3,}""".r
+  private var updateServerListTask: Cancellable = Default.Cancellable
 
-  var leftRef: ActorRef             = ActorRef.noSender
-  var rightRef: ActorRef            = ActorRef.noSender
-  var accountIntermediary: ActorRef = ActorRef.noSender
+  private var ipAddress: String         = ""
+  private var hostName: String          = ""
+  private var canonicalHostName: String = ""
+  private var port: Int                 = 0
 
-  var updateServerListTask: Cancellable = Default.Cancellable
+  private val serverName: String = Config.app.world.serverName
 
-  var ipAddress: String         = ""
-  var hostName: String          = ""
-  var canonicalHostName: String = ""
-  var port: Int                 = 0
+  private val bcryptRounds = 12
 
-  val serverName    = Config.app.world.serverName
-  val publicAddress = new InetSocketAddress(InetAddress.getByName(Config.app.public), Config.app.world.port)
+  override def preStart(): Unit = {
+    super.preStart()
+    ServiceManager.serviceManager ! Lookup("accountIntermediary")
+    ServiceManager.receptionist ! Receptionist.Find(SocketPane.SocketPaneKey, context.self)
+  }
 
-  // Reference: https://stackoverflow.com/a/50470009
-  private val numBcryptPasses = 10
-
-  ServiceManager.serviceManager ! Lookup("accountIntermediary")
-
-  override def postStop() = {
+  override def postStop(): Unit = {
     if (updateServerListTask != null)
       updateServerListTask.cancel()
   }
 
-  def receive: Receive = {
+  def receive: Receive = beforeLoginBehavior
+
+  private def persistentSetupMixinBehavior: Receive = {
     case ServiceManager.LookupResult("accountIntermediary", endpoint) =>
       accountIntermediary = endpoint
+
+    case SocketPane.SocketPaneKey.Listing(listings) =>
+      sockets = listings.head
+  }
+
+  private def idlingBehavior: Receive = persistentSetupMixinBehavior.orElse {
+    case _ => ()
+  }
+
+  private def beforeLoginBehavior: Receive = persistentSetupMixinBehavior.orElse {
     case ReceiveIPAddress(address) =>
       ipAddress = address.Address
       hostName = address.HostName
       canonicalHostName = address.CanonicalHostName
       port = address.Port
-    case UpdateServerList() =>
-      updateServerList()
-    case packet: PlanetSideGamePacket =>
-      handleGamePkt(packet)
-    case default => failWithError(s"Invalid packet class received: $default")
+      context.become(accountLoginBehavior) // Proceed directly to account login behavior without test
+
+    case _ => ()
   }
 
-  def handleGamePkt(pkt: PlanetSideGamePacket) =
+  private def accountLoginBehavior: Receive = persistentSetupMixinBehavior.orElse {
+    case packet: PlanetSideGamePacket =>
+      handleGamePktDuringLogin(packet)
+
+    case default =>
+      failWithError(s"Invalid packet class received: $default")
+  }
+
+  private def displayingServerListBehavior: Receive = persistentSetupMixinBehavior.orElse {
+    case packet: PlanetSideGamePacket =>
+      handleGamePktDuringWorldSelect(packet)
+
+    case LoginActor.UpdateServerList =>
+      updateServerList()
+
+    case SocketPane.NextPort(_, _, portNum) =>
+      val address = LoginActor.selectHostAddress(ipAddress).getAddress.getHostAddress
+      log.info(s"Connecting to ${address.toLowerCase}: $portNum ...")
+      val response = ConnectToWorldMessage(serverName, address, portNum)
+      context.become(idlingBehavior)
+      middlewareActor ! MiddlewareActor.Send(response)
+      middlewareActor ! MiddlewareActor.Close()
+
+    case default =>
+      failWithError(s"Invalid packet class received: $default")
+  }
+
+  private def waitingForServerTransferBehavior: Receive = persistentSetupMixinBehavior.orElse {
+    case SocketPane.NextPort(_, _, portNum) =>
+      val address = LoginActor.selectHostAddress(ipAddress).getAddress.getHostAddress
+      log.info(s"Connecting to ${address.toLowerCase}: $portNum ...")
+      val response = ConnectToWorldMessage(serverName, address, portNum)
+      context.become(idlingBehavior)
+      middlewareActor ! MiddlewareActor.Send(response)
+      middlewareActor ! MiddlewareActor.Close()
+
+    case _ => ()
+  }
+
+  private def handleGamePktDuringLogin(pkt: PlanetSideGamePacket): Unit = {
     pkt match {
-      case LoginMessage(majorVersion, minorVersion, buildDate, username, password, token, revision) =>
-        // TODO: prevent multiple LoginMessages from being processed in a row!! We need a state machine
-
+      case LoginMessage(majorVersion, minorVersion, buildDate, username, _, Some(token), revision) =>
         val clientVersion = s"Client Version: $majorVersion.$minorVersion.$revision, $buildDate"
+        log.debug(s"New login UN:$username Token:$token. $clientVersion")
+        accountLoginWithToken(token)
 
-        if (token.isDefined)
-          log.trace(s"New login UN:$username Token:${token.get}. $clientVersion")
-        else {
-          log.trace(s"New login UN:$username. $clientVersion")
-        }
-
+      case LoginMessage(majorVersion, minorVersion, buildDate, username, password, None, revision) =>
+        val clientVersion = s"Client Version: $majorVersion.$minorVersion.$revision, $buildDate"
+        log.debug(s"New login UN:$username. $clientVersion")
         accountLogin(username, password.getOrElse(""))
 
-      case ConnectToWorldRequestMessage(name, _, _, _, _, _, _) =>
-        log.info(s"Connect to world request for '$name'")
-        val response = ConnectToWorldMessage(serverName, publicAddress.getAddress.getHostAddress, publicAddress.getPort)
-        middlewareActor ! MiddlewareActor.Send(response)
-        middlewareActor ! MiddlewareActor.Close()
+      case _ =>
+        log.warning(s"Unhandled GamePacket $pkt")
+    }
+  }
+
+  private def handleGamePktDuringWorldSelect(pkt: PlanetSideGamePacket): Unit = {
+    pkt match {
+      case ConnectToWorldRequestMessage(name, _, _, _, _, _, _, _) =>
+        val sanitizedName = LoginActor.sanitizeServerName(name)
+        log.info(s"Request to connect to world '$sanitizedName' ...")
+        context.become(waitingForServerTransferBehavior)
+        sockets ! SocketPane.GetNextPort("world", context.self)
 
       case _ =>
-        log.warn(s"Unhandled GamePacket $pkt")
+        log.warning(s"Unhandled GamePacket $pkt")
     }
+  }
 
-  def accountLogin(username: String, password: String): Unit = {
+  private def accountLogin(username: String, password: String): Unit = {
     import ctx._
-    val newToken = this.generateToken()
+    val newToken = LoginActor.generateToken()
     val result = for {
       // backwards compatibility: prefer exact match first, then try lowercase
       accountsExact <- ctx.run(query[persistence.Account].filter(_.username == lift(username)))
@@ -130,13 +241,23 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
           Future.successful(Seq())
       }
       accountOption <- accountsExact.headOption orElse accountsLower.headOption match {
-        case Some(account) => Future.successful(Some(account))
+        // account found
+        case Some(account) =>
+          Future.successful(Some(account))
+        // create new account
         case None =>
           if (Config.app.login.createMissingAccounts) {
-            val passhash: String = password.bcrypt(numBcryptPasses)
+            // generate bcrypted passwords
+            val bcryptedPassword = LoginActor.generateNewPassword(username, password, bcryptRounds)
+            val passhash = password.bcryptBounded(bcryptRounds)
+            // save bcrypted password hash to DB
             ctx.run(
               query[persistence.Account]
-                .insert(_.passhash -> lift(passhash), _.username -> lift(username))
+                .insert(
+                  _.password -> lift(bcryptedPassword),
+                  _.passhash -> lift(passhash),
+                  _.username -> lift(username)
+                )
                 .returningGenerated(_.id)
             ) flatMap { id => ctx.run(query[persistence.Account].filter(_.id == lift(id))) } map { accounts =>
               Some(accounts.head)
@@ -146,9 +267,13 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
             Future.successful(None)
           }
       }
+
       login <- accountOption match {
         case Some(account) =>
-          (account.inactive, password.isBcrypted(account.passhash)) match {
+          // remember: this is the in client "StagingTest" login handling
+          // the password is send in clear and needs to be checked against the "old" (only bcrypted) passhash
+          // if there ever is a way to update the password in the future passhash and password need be updated
+          (account.inactive, password.isBcryptedBounded(account.passhash)) match {
             case (false, true) =>
               accountIntermediary ! StoreAccountData(newToken, Account(account.id, account.username, account.gm))
               val future = ctx.run(
@@ -160,31 +285,107 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
                   _.port              -> lift(port)
                 )
               )
+              // handle new password
+              if (account.password == "") {
+                // generate bcrypted password
+                // use username as provided by the user (db entry could be wrong), that is the way the launcher does it
+                val bcryptedPassword = LoginActor.generateNewPassword(username, password, bcryptRounds)
+                // update account, set password
+                ctx.run(
+                  query[persistence.Account]
+                    .filter(_.username == lift(account.username))
+                    .update(_.password -> lift(bcryptedPassword))
+                )
+              }
               loginSuccessfulResponse(username, newToken)
+              context.become(displayingServerListBehavior)
               updateServerListTask =
-                context.system.scheduler.scheduleWithFixedDelay(0 seconds, 5 seconds, self, UpdateServerList())
+                context.system.scheduler.scheduleWithFixedDelay(0 seconds, 5 seconds, self, LoginActor.UpdateServerList)
               future
+
             case (_, false) =>
-              loginPwdFailureResponse(username, newToken)
-              Future.successful(None)
+              loginFailurePasswordResponse(username, newToken)
+              loginFailureAction()
+
             case (true, _) =>
               loginAccountFailureResponse(username, newToken)
-              Future.successful(None)
+              loginFailureAction()
           }
-        case None => Future.successful(None)
+        case None =>
+          loginFailureAction()
       }
     } yield login
 
     result.onComplete {
-      case Success(_) =>
+      case Success(_) => ()
       case Failure(e) => log.error(e.getMessage)
     }
   }
 
-  def loginSuccessfulResponse(username: String, newToken: String) = {
+  private def accountLoginWithToken(token: String): Unit = {
+    import ctx._
+    val newToken = LoginActor.generateToken()
+    val result = for {
+      accountsExact <- ctx.run(query[persistence.Account].filter(_.token.getOrNull == lift(token)))
+      accountOption <- accountsExact.headOption match {
+        case Some(account) =>
+          // token expires after 2 hours
+          // new connections and players leaving a world server will return to desktop
+          if (LocalDateTime.now().isAfter(account.tokenCreated.get.plusHours(2))) {
+            loginFailureResponseTokenExpired(token, newToken)
+            Future.successful(None)
+          } else {
+            Future.successful(Some(account))
+          }
+
+        case None =>
+          loginFailureResponseToken(token, newToken)
+          Future.successful(None)
+      }
+
+      login <- accountOption match {
+        case Some(account) =>
+          (account.inactive, account.token.getOrElse("") == token) match {
+            case (false, true) =>
+              accountIntermediary ! StoreAccountData(newToken, Account(account.id, account.username, account.gm))
+              val future = ctx.run(
+                query[persistence.Login].insert(
+                  _.accountId -> lift(account.id),
+                  _.ipAddress -> lift(ipAddress),
+                  _.canonicalHostname -> lift(canonicalHostName),
+                  _.hostname -> lift(hostName),
+                  _.port -> lift(port)
+                )
+              )
+              loginSuccessfulResponseWithToken(account.username, token, newToken)
+              context.become(displayingServerListBehavior)
+              updateServerListTask =
+                context.system.scheduler.scheduleWithFixedDelay(0 seconds, 5 seconds, self, LoginActor.UpdateServerList)
+              future
+
+            case (_, false) =>
+              loginFailureResponseToken(account.username, token, newToken)
+              loginFailureAction()
+
+            case (true, _) =>
+              loginAccountFailureResponseToken(account.username, token, newToken)
+              loginFailureAction()
+          }
+        case None =>
+          loginFailureAction()
+      }
+    } yield login
+
+    result.onComplete {
+      case Success(_) => ()
+      case Failure(e) => log.error(e.getMessage)
+    }
+  }
+
+  private def loginSuccessfulResponse(username: String, token: String): Unit = {
     middlewareActor ! MiddlewareActor.Send(
       LoginRespMessage(
-        newToken,
+        token,
         LoginError.Success,
         StationError.AccountActive,
         StationSubscriptionStatus.Active,
@@ -195,11 +396,21 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
     )
   }
 
-  def loginPwdFailureResponse(username: String, newToken: String) = {
-    log.warn(s"Failed login to account $username")
+  private def loginSuccessfulResponseWithToken(username: String, token: String, newToken: String): Unit = {
+    log.info(s"User $username logged in using token $token")
+    loginSuccessfulResponse(username, newToken)
+  }
+
+  private def loginFailureAction(): Future[Any] = {
+    context.become(accountLoginBehavior)
+    Future.successful(None)
+  }
+
+  private def loginFailurePasswordResponse(username: String, token: String): Unit = {
+    log.warning(s"Failed login to account $username")
     middlewareActor ! MiddlewareActor.Send(
       LoginRespMessage(
-        newToken,
+        token,
         LoginError.BadUsernameOrPassword,
         StationError.AccountActive,
         StationSubscriptionStatus.Active,
@@ -210,11 +421,41 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
     )
   }
 
-  def loginFailureResponse(username: String, newToken: String) = {
-    log.warn("DB problem")
+  private def loginFailureResponseToken(token: String, newToken: String): Unit = {
+    log.warning(s"Failed login using unknown token $token")
     middlewareActor ! MiddlewareActor.Send(
       LoginRespMessage(
         newToken,
+        LoginError.BadUsernameOrPassword,
+        StationError.AccountActive,
+        StationSubscriptionStatus.Active,
+        685276011,
+        "",
+        10001
+      )
+    )
+  }
+
+  private def loginFailureResponseTokenExpired(token: String, newToken: String): Unit = {
+    log.warning(s"Failed login using expired token $token")
+    middlewareActor ! MiddlewareActor.Send(
+      LoginRespMessage(
+        newToken,
+        LoginError.BadUsernameOrPassword,
+        StationError.AccountActive,
+        StationSubscriptionStatus.Active,
+        685276011,
+        "",
+        10001
+      )
+    )
+  }
+
+  private def loginFailureResponse(username: String, token: String): Unit = {
+    log.warning(s"DB problem username: $username")
+    middlewareActor ! MiddlewareActor.Send(
+      LoginRespMessage(
+        token,
         LoginError.unk1,
         StationError.AccountActive,
         StationSubscriptionStatus.Active,
@@ -225,11 +466,26 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
     )
   }
 
-  def loginAccountFailureResponse(username: String, newToken: String) = {
-    log.warn(s"Account $username inactive")
+  private def loginFailureResponseToken(username: String, token: String, newToken: String): Unit = {
+    log.warning(s"DB problem username $username token: $token")
     middlewareActor ! MiddlewareActor.Send(
       LoginRespMessage(
         newToken,
+        LoginError.unk1,
+        StationError.AccountActive,
+        StationSubscriptionStatus.Active,
+        685276011,
+        "",
+        10001
+      )
+    )
+  }
+
+  private def loginAccountFailureResponse(username: String, token: String): Unit = {
+    log.warning(s"Account $username inactive")
+    middlewareActor ! MiddlewareActor.Send(
+      LoginRespMessage(
+        token,
         LoginError.BadUsernameOrPassword,
         StationError.AccountClosed,
         StationSubscriptionStatus.Active,
@@ -240,16 +496,23 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
     )
   }
 
-  def generateToken() = {
-    val r  = new scala.util.Random
-    val sb = new StringBuilder
-    for (_ <- 1 to 31) {
-      sb.append(r.nextPrintableChar())
-    }
-    sb.toString
+  private def loginAccountFailureResponseToken(username: String, token: String, newToken: String): Unit = {
+    log.warning(s"Account $username inactive token: $token ")
+    middlewareActor ! MiddlewareActor.Send(
+      LoginRespMessage(
+        newToken,
+        LoginError.BadUsernameOrPassword,
+        StationError.AccountClosed,
+        StationSubscriptionStatus.Active,
+        685276011,
+        "",
+        10001
+      )
+    )
   }
 
-  def updateServerList() = {
+  private def updateServerList(): Unit = {
+    //todo list of game servers from database, eventually, which is a separation of game server from login server
     middlewareActor ! MiddlewareActor.Send(
       VNLWorldStatusMessage(
         "Welcome to PlanetSide! ",
@@ -258,7 +521,7 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
             serverName,
             WorldStatus.Up,
             Config.app.world.serverType,
-            Vector(WorldConnectionInfo(publicAddress)),
+            Vector(WorldConnectionInfo(LoginActor.selectHostAddress(ipAddress))), //todo ideally, ask for info from SocketPane
             PlanetSideEmpire.VS
           )
         )
@@ -266,9 +529,8 @@ class LoginActor(middlewareActor: typed.ActorRef[MiddlewareActor.Command], conne
     )
   }
 
-  def failWithError(error: String): Unit = {
+  private def failWithError(error: String): Unit = {
     log.error(error)
     middlewareActor ! MiddlewareActor.Close()
   }
-
 }

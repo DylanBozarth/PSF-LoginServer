@@ -36,8 +36,7 @@ class ProjectileDefinition(objectId: Int)
     * `true` spawns a server-managed object */
   private var existsOnRemoteClients: Boolean        = false
   /** the values used by the `ObjectCreateMessage` packet for construction of the server-managed projectile
-    * `0, 0` are artificial values;
-    * the oicw_little_buddy is undefined for these values */
+    * `0, 0` are artificial values, except for the oicw_little_buddy which uses them */
   private var remoteClientData: (Int, Int) = (0, 0)
   /** this projectile follows its target, after a fashion */
   private var autoLock: Boolean         = false
@@ -46,8 +45,6 @@ class ProjectileDefinition(objectId: Int)
   /** projectile takes the form of a type of "grenade";
     * grenades arc with gravity rather than travel in a relatively straight path */
   private var grenade_projectile: Boolean = false
-  /** radiation clouds create independent damage-dealing areas in a zone that last for the projectile's lifespan */
-  var radiation_cloud: Boolean = false
   //derived calculations
   /** the calculated distance at which the projectile have traveled far enough to despawn (m);
     * typically handled as the projectile no longer performing damage;

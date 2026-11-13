@@ -21,9 +21,9 @@ object REKData extends Marshallable[REKData] {
   def apply(data: CommonFieldData): REKData = REKData(data, 0, 0)
 
   implicit val codec: Codec[REKData] = (
-    ("data" | CommonFieldData.codec2) ::
+    ("data" | CommonFieldData.codec_extra) ::
       ("unk1" | uint16) ::
-      ("unk2" | uint(10))
+      ("unk2" | uint(bits = 10))
   ).exmap[REKData](
     {
       case data :: u1 :: u2 :: HNil =>

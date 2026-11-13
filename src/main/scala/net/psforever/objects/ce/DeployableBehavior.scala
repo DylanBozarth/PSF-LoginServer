@@ -4,12 +4,11 @@ package net.psforever.objects.ce
 import akka.actor.{Actor, ActorRef, Cancellable}
 import net.psforever.objects.guid.{GUIDTask, TaskWorkflow}
 import net.psforever.objects._
-import net.psforever.objects.definition.DeployAnimation
 import net.psforever.objects.zones.Zone
-import net.psforever.packet.game._
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
-import net.psforever.services.local.{LocalAction, LocalServiceMessage}
+import net.psforever.packet.game.packets.{DeployableInfo, DeploymentAction}
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.base.message.SetEmpire
+import net.psforever.services.local.LocalAction
 import net.psforever.types.PlanetSideEmpire
 
 import scala.concurrent.duration._
@@ -66,16 +65,21 @@ trait DeployableBehavior {
       finalizeDeployable(callback)
 
     case Deployable.Ownership(None)
-      if DeployableObject.Owner.nonEmpty =>
+      if DeployableObject.OwnerGuid.nonEmpty =>
       val obj = DeployableObject
       if (constructed.contains(true)) {
-        loseOwnership(obj.Faction)
+        if (obj.Definition.DeployCategory == DeployableCategory.Boomers) {
+          loseOwnership(obj, PlanetSideEmpire.NEUTRAL)
+        }
+        else {
+          loseOwnership(obj, obj.Faction)
+        }
       } else {
-        obj.Owner = None
+        obj.OwnerGuid = None
       }
 
     case Deployable.Ownership(Some(player))
-      if !DeployableObject.Destroyed && DeployableObject.Owner.isEmpty =>
+      if !DeployableObject.Destroyed /*&& DeployableObject.OwnerGuid.isEmpty*/ =>
       if (constructed.contains(true)) {
         gainOwnership(player)
       } else {
@@ -98,46 +102,28 @@ trait DeployableBehavior {
     * Losing ownership involves updating map screen UI, to remove management rights from the now-previous owner,
     * and may involve concealing the deployable from the map screen for the entirety of the previous owner's faction.
     * Displaying the deployable on the map screen of another faction may be required.
+    * @param obj na
     * @param toFaction the faction to which to set the deployable to be visualized on the map and in the game world;
     *                  may also affect deployable operation
     */
-  def loseOwnership(toFaction: PlanetSideEmpire.Value): Unit = {
-    val obj = DeployableObject
-    val guid = obj.GUID
-    val zone = obj.Zone
-    val localEvents = zone.LocalEvents
-    val originalFaction = obj.Faction
-    val changeFaction = originalFaction != toFaction
-    val info = DeployableInfo(guid, DeployableIcon.Boomer, obj.Position, Service.defaultPlayerGUID)
-    if (changeFaction) {
-      obj.Faction = toFaction
-      //visual tells in regards to ownership by faction
-      zone.AvatarEvents ! AvatarServiceMessage(
-        zone.id,
-        AvatarAction.SetEmpire(Service.defaultPlayerGUID, guid, toFaction)
-      )
-      //remove knowledge by the previous owner's faction
-      localEvents ! LocalServiceMessage(
-        originalFaction.toString,
-        LocalAction.DeployableMapIcon(Service.defaultPlayerGUID, DeploymentAction.Dismiss, info)
-      )
-      //display to the given faction
-      localEvents ! LocalServiceMessage(
-        toFaction.toString,
-        LocalAction.DeployableMapIcon(Service.defaultPlayerGUID, DeploymentAction.Build, info)
-      )
-    }
+  def loseOwnership(obj: Deployable, toFaction: PlanetSideEmpire.Value): Unit = {
+    DeployableBehavior.changeOwnership(
+      obj,
+      toOwner = "",
+      toFaction,
+      DeployableInfo(obj.GUID, Deployable.Icon.apply(obj.Definition.Item), obj.Position, Default.GUID0)
+    )
     startOwnerlessDecay()
   }
 
   def startOwnerlessDecay(): Unit = {
     val obj = DeployableObject
-    if (obj.Owner.nonEmpty && decay.isCancelled) {
+    if (obj.OwnerGuid.nonEmpty && decay.isCancelled) {
       //without an owner, this deployable should begin to decay and will deconstruct later
       import scala.concurrent.ExecutionContext.Implicits.global
       decay = context.system.scheduler.scheduleOnce(Deployable.decay, self, Deployable.Deconstruct())
     }
-    obj.Owner = None //OwnerName should remain set
+    obj.OwnerGuid = None //OwnerName should remain set
   }
 
   /**
@@ -157,34 +143,18 @@ trait DeployableBehavior {
     */
   def gainOwnership(player: Player, toFaction: PlanetSideEmpire.Value): Unit = {
     val obj = DeployableObject
-    obj.AssignOwnership(player)
     decay.cancel()
-
-    val guid = obj.GUID
-    val zone = obj.Zone
-    val originalFaction = obj.Faction
-    val info = DeployableInfo(guid, DeployableIcon.Boomer, obj.Position, obj.Owner.get)
-    if (originalFaction != toFaction) {
-      obj.Faction = toFaction
-      val localEvents = zone.LocalEvents
-      zone.AvatarEvents ! AvatarServiceMessage(
-        zone.id,
-        AvatarAction.SetEmpire(Service.defaultPlayerGUID, guid, toFaction)
-      )
-      localEvents ! LocalServiceMessage(
-        originalFaction.toString,
-        LocalAction.DeployableMapIcon(Service.defaultPlayerGUID, DeploymentAction.Dismiss, info)
-      )
-      localEvents ! LocalServiceMessage(
-        toFaction.toString,
-        LocalAction.DeployableMapIcon(Service.defaultPlayerGUID, DeploymentAction.Build, info)
-      )
-    }
+    DeployableBehavior.changeOwnership(
+      obj,
+      player.Name,
+      toFaction,
+      DeployableInfo(obj.GUID, Deployable.Icon.apply(obj.Definition.Item), obj.Position, player.GUID)
+    )
+    obj.AssignOwnership(player)
   }
 
   /**
     * The first stage of the deployable build process, to put the formal process in motion.
-    * Deployables, upon construction, may display an animation effect.
     * Parameters are required to be passed onto the next stage of the build process and are not used here.
     * @see `DeployableDefinition.deployAnimation`
     * @see `DeployableDefinition.DeployTime`
@@ -192,21 +162,9 @@ trait DeployableBehavior {
     * @param callback an `ActorRef` used for confirming the deployable's completion of the process
     */
   def setupDeployable(callback: ActorRef): Unit = {
+    import scala.concurrent.ExecutionContext.Implicits.global
     val obj = DeployableObject
     constructed = Some(false)
-    if (obj.Definition.deployAnimation == DeployAnimation.Standard) {
-      val zone = obj.Zone
-      zone.LocalEvents ! LocalServiceMessage(
-        zone.id,
-        LocalAction.TriggerEffectLocation(
-          obj.Owner.getOrElse(Service.defaultPlayerGUID),
-          "spawn_object_effect",
-          obj.Position,
-          obj.Orientation
-        )
-      )
-    }
-    import scala.concurrent.ExecutionContext.Implicits.global
     setup = context.system.scheduler.scheduleOnce(
       obj.Definition.DeployTime milliseconds,
       self,
@@ -220,7 +178,7 @@ trait DeployableBehavior {
     * Nothing dangerous happens if it does not begin to decay, but, because it is not under a player's management,
     * the deployable will not properly transition to a decay state for another reason
     * and can linger in the zone ownerless for as long as it is not destroyed.
-    * @see `AvatarAction.DeployItem`
+    * @see `LocalAction.DeployItem`
     * @see `DeploymentAction`
     * @see `DeployableInfo`
     * @see `LocalAction.DeployableMapIcon`
@@ -232,27 +190,21 @@ trait DeployableBehavior {
     setup = Default.Cancellable
     constructed = Some(true)
     val obj = DeployableObject
-    val zone       = obj.Zone
+    val zone = obj.Zone
     val localEvents = zone.LocalEvents
-    val owner     = obj.Owner.getOrElse(Service.defaultPlayerGUID)
-    obj.OwnerName match {
-      case Some(_) =>
-      case None    =>
-        import scala.concurrent.ExecutionContext.Implicits.global
-        decay = context.system.scheduler.scheduleOnce(
-          Deployable.decay,
-          self,
-          Deployable.Deconstruct()
-        )
+    obj.OwnerName.orElse {
+      import scala.concurrent.ExecutionContext.Implicits.global
+      decay = context.system.scheduler.scheduleOnce(Deployable.decay, self, Deployable.Deconstruct())
+      None
     }
     //zone build
-    zone.AvatarEvents ! AvatarServiceMessage(zone.id, AvatarAction.DeployItem(Service.defaultPlayerGUID, obj))
-    //zone map icon
-    localEvents ! LocalServiceMessage(
-      obj.Faction.toString,
-      LocalAction.DeployableMapIcon(
-        Service.defaultPlayerGUID,
-        DeploymentAction.Build, DeployableInfo(obj.GUID, Deployable.Icon(obj.Definition.Item), obj.Position, owner)
+    localEvents ! BundledEnvelope(
+      /* zone build */
+      MessageEnvelope(zone.id, LocalAction.DeployItem(obj)),
+      /* zone map icon */
+      MessageEnvelope(
+        obj.Faction.toString,
+        LocalAction.DeployableMapIcon(DeploymentAction.Build, DeployableInfo(obj.GUID, Deployable.Icon(obj.Definition.Item), obj.Position, obj.OwnerGuid.getOrElse(Default.GUID0)))
       )
     )
     //local build management
@@ -297,7 +249,7 @@ trait DeployableBehavior {
     //there's no special meaning behind directing any replies from from zone governance straight back to zone governance
     //this deployable control agency, however, will be expiring and can not be a recipient
     zone.Deployables ! Zone.Deployable.Dismiss(obj)
-    zone.LocalEvents ! LocalServiceMessage(
+    zone.LocalEvents ! MessageEnvelope(
       zone.id,
       LocalAction.EliminateDeployable(obj, obj.GUID, obj.Position, deletionType)
     )
@@ -306,7 +258,9 @@ trait DeployableBehavior {
     if (!obj.Destroyed) {
       Deployables.AnnounceDestroyDeployable(obj)
     }
-    obj.OwnerName = None
+    val guid = obj.OwnerGuid
+    obj.AssignOwnership(None)
+    obj.OwnerGuid = guid
   }
 }
 
@@ -316,4 +270,35 @@ object DeployableBehavior {
 
   /** internal message for progresisng the deconstruction process */
   private case class FinalizeElimination()
+
+  /**
+   * na
+   * @param obj na
+   * @param toFaction na
+   * @param info na
+   */
+  def changeOwnership(obj: Deployable, toOwner: String, toFaction: PlanetSideEmpire.Value, info: DeployableInfo): Unit = {
+    val dGuid = obj.GUID
+    val originalFaction = obj.Faction
+    val zone = obj.Zone
+    val localEvents = zone.LocalEvents
+    if (originalFaction != toFaction) {
+      obj.Faction = toFaction
+      localEvents ! BundledEnvelope(
+        /* visual tells in regards to ownership by faction */
+        MessageEnvelope(zone.id, SetEmpire(dGuid, toFaction)),
+        /* remove knowledge by the previous owner's faction */
+        MessageEnvelope(originalFaction.toString, LocalAction.DeployableMapIcon(DeploymentAction.Dismiss, info)),
+        /* display to the given faction */
+        MessageEnvelope(toFaction.toString, LocalAction.DeployableMapIcon(DeploymentAction.Build, info))
+      )
+      //remove deployable from original owner's toolbox and UI counter
+      localEvents ! BundledEnvelope(zone.AllPlayers
+        .filter(p => obj.OriginalOwnerName.contains(p.Name))
+        .map { originalOwner =>
+          originalOwner.avatar.deployables.Remove(obj)
+          MessageEnvelope(originalOwner.Name, LocalAction.DeployableUIFor(obj.Definition.Item))
+        })
+    }
+  }
 }

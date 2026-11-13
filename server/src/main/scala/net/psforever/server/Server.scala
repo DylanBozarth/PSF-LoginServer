@@ -5,7 +5,8 @@ import java.nio.file.Paths
 import java.util.Locale
 import java.util.UUID.randomUUID
 import java.util.concurrent.atomic.AtomicLong
-
+import scala.concurrent.Future
+import scala.concurrent.Await
 import akka.actor.ActorSystem
 import akka.actor.typed.ActorRef
 import akka.actor.typed.scaladsl.Behaviors
@@ -13,8 +14,7 @@ import akka.{actor => classic}
 import ch.qos.logback.classic.LoggerContext
 import ch.qos.logback.classic.joran.JoranConfigurator
 import io.sentry.{Sentry, SentryOptions}
-import kamon.Kamon
-import net.psforever.actors.net.{LoginActor, MiddlewareActor, SocketActor}
+import net.psforever.actors.net.{LoginActor, MiddlewareActor, SocketSetup, SocketSetupInfo, SocketPane}
 import net.psforever.actors.session.SessionActor
 import net.psforever.login.psadmin.PsAdminActor
 import net.psforever.login._
@@ -25,7 +25,7 @@ import net.psforever.services.chat.ChatService
 import net.psforever.services.galaxy.GalaxyService
 import net.psforever.services.properties.PropertyOverrideManager
 import net.psforever.services.teamwork.SquadService
-import net.psforever.services.{InterstellarClusterService, ServiceManager}
+import net.psforever.services.{CavernRotationService, InterstellarClusterService, ServiceManager}
 import net.psforever.util.Config
 import net.psforever.zones.Zones
 import org.apache.commons.io.FileUtils
@@ -35,8 +35,11 @@ import org.fusesource.jansi.Ansi._
 import org.slf4j
 import scopt.OParser
 import akka.actor.typed.scaladsl.adapter._
+import kamon.Kamon
 import net.psforever.packet.PlanetSidePacket
 import net.psforever.services.hart.HartService
+
+import scala.concurrent.duration.Duration
 
 object Server {
   private val logger = org.log4s.getLogger
@@ -84,7 +87,6 @@ object Server {
       logger.info("Starting Kamon")
       Kamon.init()
     }
-
     if (Config.app.sentry.enable) {
       logger.info(s"Enabling Sentry")
       val options = new SentryOptions()
@@ -96,11 +98,27 @@ object Server {
     implicit val system: ActorSystem = classic.ActorSystem("PsLogin")
     Default(system)
 
+    val zones = Zones.zones :+ Zone.Nowhere
+    val serviceManager = ServiceManager.boot
+    serviceManager ! ServiceManager.Register(classic.Props[AccountIntermediaryService](), "accountIntermediary")
+    serviceManager ! ServiceManager.Register(GalaxyService(), "galaxy")
+    serviceManager ! ServiceManager.Register(classic.Props[SquadService](), "squad")
+    serviceManager ! ServiceManager.Register(classic.Props[AccountPersistenceService](), "accountPersistence")
+    serviceManager ! ServiceManager.Register(classic.Props[PropertyOverrideManager](), "propertyOverrideManager")
+    serviceManager ! ServiceManager.Register(classic.Props[HartService](), "hart")
+
+    system.spawn(CavernRotationService(), CavernRotationService.CavernRotationServiceKey.id)
+    system.spawn(InterstellarClusterService(zones), InterstellarClusterService.InterstellarClusterServiceKey.id)
+    system.spawn(ChatService(), ChatService.ChatServiceKey.id)
+
     // typed to classic wrappers for login and session actors
-    val login = (ref: ActorRef[MiddlewareActor.Command], info: InetSocketAddress, connectionId: String) => {
+    val loginPlan = (ref: ActorRef[MiddlewareActor.Command], info: InetSocketAddress, connectionId: String) => {
       import net.psforever.services.account.IPAddress
       Behaviors.setup[PlanetSidePacket](context => {
-        val actor = context.actorOf(classic.Props(new LoginActor(ref, connectionId, Login.getNewId())), "login")
+        val actor = context.actorOf(
+          classic.Props(new LoginActor(ref, connectionId, Login.getNewId())).withDispatcher("login-session"),
+          "login"
+        )
         actor ! ReceiveIPAddress(new IPAddress(info))
         Behaviors.receiveMessage(message => {
           actor ! message
@@ -108,32 +126,27 @@ object Server {
         })
       })
     }
-    val session = (ref: ActorRef[MiddlewareActor.Command], info: InetSocketAddress, connectionId: String) => {
+    val sessionPlan = (ref: ActorRef[MiddlewareActor.Command], info: InetSocketAddress, connectionId: String) => {
       Behaviors.setup[PlanetSidePacket](context => {
-        val uuid  = randomUUID().toString
-        val actor = context.actorOf(classic.Props(new SessionActor(ref, connectionId, Session.getNewId())), s"session-$uuid")
+        val uuid = randomUUID().toString
+        val actor =
+          context.actorOf(
+            classic.Props(new SessionActor(ref, connectionId, Session.getNewId())).withDispatcher("world-session"),
+            s"session-$uuid"
+          )
         Behaviors.receiveMessage(message => {
           actor ! message
           Behaviors.same
         })
       })
     }
-
-    val zones = Zones.zones ++ Seq(Zone.Nowhere)
-
-    system.spawn(ChatService(), ChatService.ChatServiceKey.id)
-    system.spawn(InterstellarClusterService(zones), InterstellarClusterService.InterstellarClusterServiceKey.id)
-
-    val serviceManager = ServiceManager.boot
-    serviceManager ! ServiceManager.Register(classic.Props[AccountIntermediaryService](), "accountIntermediary")
-    serviceManager ! ServiceManager.Register(classic.Props[GalaxyService](), "galaxy")
-    serviceManager ! ServiceManager.Register(classic.Props[SquadService](), "squad")
-    serviceManager ! ServiceManager.Register(classic.Props[AccountPersistenceService](), "accountPersistence")
-    serviceManager ! ServiceManager.Register(classic.Props[PropertyOverrideManager](), "propertyOverrideManager")
-    serviceManager ! ServiceManager.Register(classic.Props[HartService](), "hart")
-
-    system.spawn(SocketActor(new InetSocketAddress(bindAddress, Config.app.login.port), login), "login-socket")
-    system.spawn(SocketActor(new InetSocketAddress(bindAddress, Config.app.world.port), session), "world-socket")
+    system.spawn(
+      SocketPane(Seq(
+        SocketSetup("login", SocketSetupInfo(bindAddress, Seq(Config.app.login.port), loginPlan)),
+        SocketSetup("world", SocketSetupInfo(bindAddress, Config.app.world.port +: Config.app.world.ports, sessionPlan))
+      )),
+      name = SocketPane.SocketPaneKey.id
+    )
 
     val adminListener = system.actorOf(
       classic.Props(
@@ -156,6 +169,8 @@ object Server {
       // TODO: clean up active sessions and close resources safely
       logger.info("Login server now shutting down...")
     }
+
+    Await.ready(Future.never, Duration.Inf)
   }
 
   def flyway(args: CliConfig): Flyway = {
@@ -228,6 +243,7 @@ object Server {
   }
 
   sealed trait AuthoritativeCounter {
+
     /** the id accumulator */
     private val masterIdKeyRing: AtomicLong = new AtomicLong(0L)
 

@@ -3,14 +3,15 @@ package net.psforever.objects.serverobject.pad.process
 
 import akka.actor.Props
 import net.psforever.objects.PlanetSideGameObject
-import net.psforever.objects.ballistics.SourceEntry
 import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.pad.{VehicleSpawnControl, VehicleSpawnPad}
-import net.psforever.objects.vital.Vitality
+import net.psforever.objects.sourcing.SourceEntry
 import net.psforever.objects.vital.etc.{ExplodingEntityReason, VehicleSpawnReason}
 import net.psforever.objects.vital.interaction.{DamageInteraction, DamageResult}
 import net.psforever.objects.vital.prop.DamageProperties
+import net.psforever.objects.vital.Vitality
 import net.psforever.objects.zones.Zone
+import net.psforever.services.base.envelope.MessageEnvelope
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -37,9 +38,10 @@ class VehicleSpawnControlRailJack(pad: VehicleSpawnPad) extends VehicleSpawnCont
         pad.Zone,
         pad,
         VehicleSpawnControlRailJack.prepareSpawnExplosion(pad, SourceEntry(driver), SourceEntry(vehicle)),
-        pad.Definition.killBox(pad, vehicle.Definition.CanFly)
+        pad.Definition.killBox(pad, vehicle.Definition.CanFly),
+        Zone.findAllTargets
       )
-      pad.Zone.VehicleEvents ! VehicleSpawnPad.AttachToRails(vehicle, pad)
+      pad.Zone.VehicleEvents ! MessageEnvelope(pad.Zone.id, VehicleSpawnPad.AttachToRails(vehicle, pad))
       context.system.scheduler.scheduleOnce(10 milliseconds, seatDriver, order)
 
     case msg @ (VehicleSpawnControl.ProcessControl.Reminder | VehicleSpawnControl.ProcessControl.GetNewOrder) =>

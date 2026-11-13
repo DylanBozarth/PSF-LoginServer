@@ -2,22 +2,81 @@
 package net.psforever.objects.serverobject.turret
 
 import net.psforever.objects.equipment.JammableUnit
-import net.psforever.objects.serverobject.structures.Amenity
+import net.psforever.objects.serverobject.interior.Sidedness
+import net.psforever.objects.serverobject.mount.interaction.InteractWithRadiationCloudsSeatedInEntity
+import net.psforever.objects.serverobject.structures.{Amenity, AmenityOwner, Building}
 import net.psforever.objects.serverobject.terminals.capture.CaptureTerminalAware
+import net.psforever.objects.serverobject.turret.auto.AutomatedTurret
+import net.psforever.objects.sourcing.SourceEntry
+import net.psforever.objects.vital.resistance.StandardResistanceProfile
+import net.psforever.objects.zones.interaction.InteractsWithZone
 import net.psforever.types.Vector3
 
 class FacilityTurret(tDef: FacilityTurretDefinition)
   extends Amenity
-    with WeaponTurret
+    with AutomatedTurret
+    with StandardResistanceProfile
     with JammableUnit
+    with InteractsWithZone
     with CaptureTerminalAware {
-  WeaponTurret.LoadDefinition(this)
+  interaction(new InteractWithRadiationCloudsSeatedInEntity(obj = this, range = 100f))
+  WeaponTurret.LoadDefinition(turret = this)
+  WhichSide = Sidedness.OutsideOf
+
+  private var turretUpgradeTime: Long = System.currentTimeMillis()
+  private var turretUpgradeTimeSet: Boolean = false
+
+  override def isUpgrading: Boolean = {
+    val baseUpgradingState = super.isUpgrading
+    val upgradingTimeSet = if (turretUpgradeTimeSet) {
+      turretUpgradeTimeSet = System.currentTimeMillis() - turretUpgradeTime < 1500L
+      turretUpgradeTimeSet
+    } else {
+      false
+    }
+    baseUpgradingState || upgradingTimeSet
+  }
+
+  def UpdateTurretUpgradeTime(): Long = {
+    turretUpgradeTime = System.currentTimeMillis()
+    turretUpgradeTimeSet = true
+    turretUpgradeTime
+  }
+
+  // Used for checking the time without updating it
+  def CheckTurretUpgradeTime: Long = {
+    if (!turretUpgradeTimeSet) {
+      turretUpgradeTime = System.currentTimeMillis()
+      turretUpgradeTimeSet = true
+    }
+    turretUpgradeTime
+  }
+
+  def FinishedTurretUpgradeReset(): Unit = {
+    turretUpgradeTimeSet = false
+  }
+
+  def TurretOwner: SourceEntry = {
+    Seats
+      .headOption
+      .collect { case (_, a) => a }
+      .flatMap(_.occupant)
+      .map(SourceEntry(_))
+      .getOrElse(SourceEntry(Owner))
+  }
+
+  override def Owner: AmenityOwner = {
+    if (Zone.isACavern) {
+      Building.NoBuilding
+    } else {
+      super.Owner
+    }
+  }
 
   def Definition: FacilityTurretDefinition = tDef
 }
 
 object FacilityTurret {
-
   /**
     * Overloaded constructor.
     * @param tDef the `ObjectDefinition` that constructs this object and maintains some of its immutable fields
@@ -26,9 +85,6 @@ object FacilityTurret {
   def apply(tDef: FacilityTurretDefinition): FacilityTurret = {
     new FacilityTurret(tDef)
   }
-
-  final case class RechargeAmmo()
-  final case class WeaponDischarged()
 
   import akka.actor.ActorContext
 

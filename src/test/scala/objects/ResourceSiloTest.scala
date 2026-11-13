@@ -1,10 +1,11 @@
 // Copyright (c) 2017 PSForever
 package objects
 
-import akka.actor.Props
+import akka.actor.{ActorRef, Props}
 import akka.testkit.TestProbe
 import base.{ActorTest, FreedContextActorTest}
 import net.psforever.actors.zone.BuildingActor
+import net.psforever.actors.zone.building.MajorFacilityLogic
 import net.psforever.objects.guid.NumberPoolHub
 import net.psforever.objects.guid.source.MaxNumberSource
 import net.psforever.objects.serverobject.CommonMessages
@@ -13,11 +14,13 @@ import net.psforever.objects.serverobject.resourcesilo.{ResourceSilo, ResourceSi
 import net.psforever.objects.serverobject.structures.{Building, StructureType}
 import net.psforever.objects.serverobject.transfer.TransferBehavior
 import net.psforever.objects.zones.{Zone, ZoneMap}
-import net.psforever.packet.game.UseItemMessage
 import net.psforever.types._
 import org.specs2.mutable.Specification
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
 import net.psforever.objects.avatar.Avatar
+import net.psforever.objects.serverobject.structures.participation.MajorFacilityHackParticipation
+import net.psforever.packet.game.packets.UseItemMessage
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.PlanetsideAttribute
 import net.psforever.services.{InterstellarClusterService, Service, ServiceManager}
 import net.psforever.services.galaxy.GalaxyService
 
@@ -63,7 +66,7 @@ class ResourceSiloTest extends Specification {
         PlanetSideGUID(0),
         PlanetSideGUID(2),
         0L,
-        false,
+        unk3 = false,
         Vector3(0f, 0f, 0f),
         Vector3(0f, 0f, 0f),
         0,
@@ -77,11 +80,11 @@ class ResourceSiloTest extends Specification {
 }
 
 class ResourceSiloControlStartupTest extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
-  val buildingEvents = TestProbe("test-building-events")
+  val buildingEvents: TestProbe = TestProbe("test-building-events")
   obj.Owner =
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building) {
       Actor = buildingEvents.ref
@@ -90,18 +93,18 @@ class ResourceSiloControlStartupTest extends ActorTest {
 
   "Resource silo" should {
     "startup properly" in {
-      obj.Actor ! Service.Startup()
+      obj.Actor ! Service.Startup
       expectNoMessage(max = 1000 milliseconds)
     }
   }
 }
 
 class ResourceSiloControlStartupMessageNoneTest extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
-  val buildingEvents = TestProbe("test-building-events")
+  val buildingEvents: TestProbe = TestProbe("test-building-events")
   obj.Owner =
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building) {
       Actor = buildingEvents.ref
@@ -112,7 +115,7 @@ class ResourceSiloControlStartupMessageNoneTest extends ActorTest {
     "report if it has no NTU on startup" in {
       obj.NtuCapacitor = 0
       assert(obj.NtuCapacitor == 0)
-      obj.Actor ! Service.Startup()
+      obj.Actor ! Service.Startup
       val ownerMsg = buildingEvents.receiveOne(200 milliseconds)
       assert(ownerMsg match {
         case BuildingActor.NtuDepleted() => true
@@ -123,11 +126,11 @@ class ResourceSiloControlStartupMessageNoneTest extends ActorTest {
 }
 
 class ResourceSiloControlStartupMessageSomeTest extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
-  val buildingEvents = TestProbe("test-building-events")
+  val buildingEvents: TestProbe = TestProbe("test-building-events")
   obj.Owner =
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building) {
       Actor = buildingEvents.ref
@@ -138,7 +141,7 @@ class ResourceSiloControlStartupMessageSomeTest extends ActorTest {
     "report if it has any NTU on startup" in {
       obj.NtuCapacitor = 1
       assert(obj.NtuCapacitor == 1)
-      obj.Actor ! Service.Startup()
+      obj.Actor ! Service.Startup
       val ownerMsg = buildingEvents.receiveOne(200 milliseconds)
       assert(ownerMsg match {
         case BuildingActor.SuppliedWithNtu() => true
@@ -150,24 +153,23 @@ class ResourceSiloControlStartupMessageSomeTest extends ActorTest {
 
 class ResourceSiloControlUseTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
-  system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   var buildingMap = new TrieMap[Int, Building]()
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
-  val player = Player(Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))
-  val ant = Vehicle(GlobalDefinitions.ant)
+  val player: Player = Player(Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))
+  val ant: Vehicle = Vehicle(GlobalDefinitions.ant)
   val silo = new ResourceSilo()
-  val catchall = new TestProbe(system).ref
-  val zone = new Zone("test", new ZoneMap("test-map"), 0) {
-    override def SetupNumberPools() = {}
+  val catchall: ActorRef = new TestProbe(system).ref
+  val zone: Zone = new Zone("test", new ZoneMap("test-map"), 0) {
+    override def SetupNumberPools(): Unit = {}
     GUID(guid)
-    override def AvatarEvents = catchall
-    override def LocalEvents = catchall
-    override def VehicleEvents = catchall
-    override def Activity = catchall
-    override def Vehicles = List(ant)
-    override def Buildings = { buildingMap.toMap }
+    override def AvatarEvents: ActorRef = catchall
+    override def LocalEvents: ActorRef = catchall
+    override def VehicleEvents: ActorRef = catchall
+    override def Activity: ActorRef = catchall
+    override def Vehicles: List[Vehicle] = List(ant)
+    override def Buildings: Map[Int, Building] = { buildingMap.toMap }
   }
   val building = new Building(
     name = "integ-fac-test-building",
@@ -178,7 +180,8 @@ class ResourceSiloControlUseTest extends FreedContextActorTest {
     GlobalDefinitions.cryo_facility
   )
   buildingMap += 6 -> building
-  building.Actor = context.spawn(BuildingActor(zone, building), "integ-fac-test-building-control").toClassic
+  system.spawn(InterstellarClusterService(Seq(zone)), InterstellarClusterService.InterstellarClusterServiceKey.id)
+  building.Actor = context.spawn(BuildingActor(zone, building, MajorFacilityLogic), "integ-fac-test-building-control").toClassic
   building.Invalidate()
 
   guid.register(player, number = 1)
@@ -186,7 +189,7 @@ class ResourceSiloControlUseTest extends FreedContextActorTest {
   guid.register(silo, number = 5)
   guid.register(building, number = 6)
 
-  val maxNtuCap = ant.Definition.MaxNtuCapacitor
+  val maxNtuCap: Float = ant.Definition.MaxNtuCapacitor
   player.Spawn()
   ant.NtuCapacitor = maxNtuCap
   val probe = new TestProbe(system)
@@ -196,24 +199,23 @@ class ResourceSiloControlUseTest extends FreedContextActorTest {
   ant.DeploymentState = DriveState.Deployed
   building.Amenities = silo
   silo.Actor = system.actorOf(Props(classOf[ResourceSiloControl], silo), "test-silo")
-  silo.Actor ! Service.Startup()
+  silo.Actor ! Service.Startup
 
   "Resource silo" should {
     "respond when being used" in {
       expectNoMessage(1 seconds)
-      silo.Actor ! CommonMessages.Use(ResourceSiloTest.player)
-
-      val reply = probe.receiveOne(2000 milliseconds)
-      assert(reply match {
-        case TransferBehavior.Discharging(Ntu.Nanites) => true
-        case _                                         => false
-      })
+      silo.Actor ! CommonMessages.Use(ResourceSiloTest.player, Some(ant))
+      val reply = probe.receiveOne(3000 milliseconds)
+      reply match {
+        case TransferBehavior.Discharging(Ntu.Nanites) => ()
+        case _                                         => assert(ResourceSiloTest.fail, "")
+      }
     }
   }
 }
 
 class ResourceSiloControlNtuWarningTest extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
@@ -223,9 +225,9 @@ class ResourceSiloControlNtuWarningTest extends ActorTest {
     }
   obj.Owner.GUID = PlanetSideGUID(6)
 
-  val zoneEvents = TestProbe("zone-events")
+  val zoneEvents: TestProbe = TestProbe("zone-events")
   zone.AvatarEvents = zoneEvents.ref
-  obj.Actor ! Service.Startup()
+  obj.Actor ! Service.Startup
   obj.Actor ! ResourceSilo.UpdateChargeLevel(-obj.NtuCapacitor)
   zoneEvents.receiveN(3, 500.milliseconds) //events from setup
 
@@ -236,8 +238,8 @@ class ResourceSiloControlNtuWarningTest extends ActorTest {
 
       val reply = zoneEvents.receiveOne(5000 milliseconds)
       reply match {
-        case AvatarServiceMessage("nowhere", AvatarAction.PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
-        case _ => assert(false, s"$reply is wrong")
+        case MessageEnvelope("nowhere", _, PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
+        case _ => assert(ResourceSiloTest.fail, s"$reply is wrong")
       }
       assert(!obj.LowNtuWarningOn)
     }
@@ -245,7 +247,7 @@ class ResourceSiloControlNtuWarningTest extends ActorTest {
 }
 
 class ResourceSiloControlUpdate1Test extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
@@ -253,11 +255,11 @@ class ResourceSiloControlUpdate1Test extends ActorTest {
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building)
   bldg.GUID = PlanetSideGUID(6)
   obj.Owner = bldg
-  val zoneEvents     = TestProbe("zone-events")
-  val buildingEvents = TestProbe("building-events")
+  val zoneEvents: TestProbe = TestProbe("zone-events")
+  val buildingEvents: TestProbe = TestProbe("building-events")
   zone.AvatarEvents = zoneEvents.ref
   bldg.Actor = buildingEvents.ref
-  obj.Actor ! Service.Startup()
+  obj.Actor ! Service.Startup
   buildingEvents.receiveOne(500 milliseconds) //message caused by "startup"
   obj.Actor ! ResourceSilo.UpdateChargeLevel(-obj.NtuCapacitor)
   zoneEvents.receiveN(3, 500.milliseconds) //events from setup
@@ -275,13 +277,13 @@ class ResourceSiloControlUpdate1Test extends ActorTest {
       assert(obj.NtuCapacitor == 305)
       assert(obj.CapacitorDisplay == 3)
       reply1.head match {
-        case AvatarServiceMessage("nowhere", AvatarAction.PlanetsideAttribute(PlanetSideGUID(1), 45, 3)) => ;
-        case _ => assert(false, s"$reply1 is wrong")
+        case MessageEnvelope("nowhere", _, PlanetsideAttribute(PlanetSideGUID(1), 45, 3)) => ;
+        case _ => assert(ResourceSiloTest.fail, s"$reply1 is wrong")
       }
       assert(reply2.isInstanceOf[BuildingActor.MapUpdate], s"$reply2 is wrong")
       reply1(1) match {
-        case AvatarServiceMessage("nowhere", AvatarAction.PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
-        case _ => assert(false, s"${reply1(1)} is wrong")
+        case MessageEnvelope("nowhere", _, PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
+        case _ => assert(ResourceSiloTest.fail, s"${reply1(1)} is wrong")
       }
       assert(!obj.LowNtuWarningOn)
     }
@@ -289,7 +291,7 @@ class ResourceSiloControlUpdate1Test extends ActorTest {
 }
 
 class ResourceSiloControlUpdate2Test extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
@@ -297,11 +299,11 @@ class ResourceSiloControlUpdate2Test extends ActorTest {
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building)
   bldg.GUID = PlanetSideGUID(6)
   obj.Owner = bldg
-  val zoneEvents     = TestProbe("zone-events")
-  val buildingEvents = TestProbe("building-events")
+  val zoneEvents: TestProbe = TestProbe("zone-events")
+  val buildingEvents: TestProbe = TestProbe("building-events")
   zone.AvatarEvents = zoneEvents.ref
   bldg.Actor = buildingEvents.ref
-  obj.Actor ! Service.Startup()
+  obj.Actor ! Service.Startup
   buildingEvents.receiveOne(500 milliseconds) //message caused by "startup"
   obj.Actor ! ResourceSilo.UpdateChargeLevel(-obj.NtuCapacitor + 100)
   zoneEvents.receiveN(3, 500.milliseconds) //events from setup
@@ -319,13 +321,13 @@ class ResourceSiloControlUpdate2Test extends ActorTest {
       assert(obj.NtuCapacitor == 205)
       assert(obj.CapacitorDisplay == 2)
       reply1.head match {
-        case AvatarServiceMessage("nowhere", AvatarAction.PlanetsideAttribute(PlanetSideGUID(1), 45, 2)) => ;
-        case _ => assert(false, s"$reply1 is wrong")
+        case MessageEnvelope("nowhere", _, PlanetsideAttribute(PlanetSideGUID(1), 45, 2)) => ;
+        case _ => assert(ResourceSiloTest.fail, s"$reply1 is wrong")
       }
       assert(reply2.isInstanceOf[BuildingActor.MapUpdate])
       reply1(1) match {
-        case AvatarServiceMessage("nowhere", AvatarAction.PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
-        case _ => assert(false, s"${reply1(1)} is wrong")
+        case MessageEnvelope("nowhere", _, PlanetsideAttribute(PlanetSideGUID(6), 47, 0)) => ;
+        case _ => assert(ResourceSiloTest.fail, s"${reply1(1)} is wrong")
       }
       assert(!obj.LowNtuWarningOn)
     }
@@ -333,7 +335,7 @@ class ResourceSiloControlUpdate2Test extends ActorTest {
 }
 
 class ResourceSiloControlNoUpdateTest extends ActorTest {
-  val obj = ResourceSilo()
+  val obj: ResourceSilo = ResourceSilo()
   obj.GUID = PlanetSideGUID(1)
   obj.Actor = system.actorOf(Props(classOf[ResourceSiloControl], obj), "test-silo")
   val zone = new Zone("nowhere", new ZoneMap("nowhere-map"), 0)
@@ -341,11 +343,11 @@ class ResourceSiloControlNoUpdateTest extends ActorTest {
     new Building("Building", building_guid = 6, map_id = 0, zone, StructureType.Building, GlobalDefinitions.building)
   bldg.GUID = PlanetSideGUID(6)
   obj.Owner = bldg
-  val zoneEvents     = TestProbe("zone-events")
-  val buildingEvents = TestProbe("building-events")
+  val zoneEvents: TestProbe = TestProbe("zone-events")
+  val buildingEvents: TestProbe = TestProbe("building-events")
   zone.AvatarEvents = zoneEvents.ref
   bldg.Actor = buildingEvents.ref
-  obj.Actor ! Service.Startup()
+  obj.Actor ! Service.Startup
   obj.NtuCapacitor = 0
 
   "Resource silo" should {
@@ -371,7 +373,9 @@ class ResourceSiloControlNoUpdateTest extends ActorTest {
 }
 
 object ResourceSiloTest {
-  val player = Player(
-    new Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute)
+  val player: Player = Player(
+    Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute).copy(stamina = 0)
   )
+
+  val fail: Boolean = false
 }

@@ -99,7 +99,7 @@ class Tool(private val toolDef: ToolDefinition)
   }
 
   def Discharge(rounds: Option[Int] = None): Int = {
-    lastDischarge = System.nanoTime()
+    lastDischarge = System.currentTimeMillis()
     Magazine = FireMode.Discharge(this, rounds)
   }
 
@@ -256,5 +256,3 @@ object Tool {
     def Definition: FireModeDefinition = fdef
   }
 }
-
-

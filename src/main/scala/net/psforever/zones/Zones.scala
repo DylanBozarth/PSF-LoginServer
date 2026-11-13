@@ -1,18 +1,18 @@
 package net.psforever.zones
 
 import java.io.FileNotFoundException
-
 import net.psforever.objects.serverobject.terminals.{ProximityTerminal, ProximityTerminalDefinition, Terminal, TerminalDefinition}
 import net.psforever.objects.serverobject.mblocker.Locker
-import java.util.concurrent.atomic.AtomicInteger
 
+import java.util.concurrent.atomic.AtomicInteger
 import akka.actor.ActorContext
 import io.circe._
 import io.circe.parser._
+import net.psforever.actors.zone.building.{BuildingLogic, CavernFacilityLogic, FacilityLogic, MajorFacilityLogic, WarpGateLogic}
 import net.psforever.objects.{GlobalDefinitions, LocalLockerItem, LocalProjectile}
-import net.psforever.objects.ballistics.Projectile
 import net.psforever.objects.definition.BasicDefinition
 import net.psforever.objects.guid.selector.{NumberSelector, RandomSelector, SpecificSelector}
+import net.psforever.objects.serverobject.dome.{ForceDomeDefinition, ForceDomePhysics}
 import net.psforever.objects.serverobject.doors.{Door, DoorDefinition, SpawnTubeDoor}
 import net.psforever.objects.serverobject.generator.Generator
 import net.psforever.objects.serverobject.llu.{CaptureFlagSocket, CaptureFlagSocketDefinition}
@@ -21,12 +21,13 @@ import net.psforever.objects.serverobject.pad.{VehicleSpawnPad, VehicleSpawnPadD
 import net.psforever.objects.serverobject.painbox.{Painbox, PainboxDefinition}
 import net.psforever.objects.serverobject.resourcesilo.ResourceSilo
 import net.psforever.objects.serverobject.shuttle.OrbitalShuttlePad
-import net.psforever.objects.serverobject.structures.{Building, BuildingDefinition, FoundationBuilder, StructureType, WarpGate}
+import net.psforever.objects.serverobject.structures.{Building, BuildingDefinition, FoundationBuilder, StructureType, VirtualTrainingTeleporter, WarpGate}
 import net.psforever.objects.serverobject.terminals.capture.{CaptureTerminal, CaptureTerminalDefinition}
-import net.psforever.objects.serverobject.terminals.implant.ImplantTerminalMech
+import net.psforever.objects.serverobject.terminals.implant.{ImplantTerminalInterface, ImplantTerminalMech}
 import net.psforever.objects.serverobject.tube.SpawnTube
-import net.psforever.objects.serverobject.turret.{FacilityTurret, FacilityTurretDefinition}
+import net.psforever.objects.serverobject.turret.{FacilityTurret, FacilityTurretDefinition, VanuSentry}
 import net.psforever.objects.serverobject.zipline.ZipLinePath
+import net.psforever.objects.sourcing.{DeployableSource, PlayerSource, TurretSource, VehicleSource}
 import net.psforever.objects.zones.{MapInfo, Zone, ZoneInfo, ZoneMap}
 import net.psforever.types.{Angular, PlanetSideEmpire, Vector3}
 import net.psforever.util.DefinitionUtil
@@ -62,7 +63,7 @@ object Zones {
                                      max: Int,
                                      selector: String
                                    ) {
-    def getSelector() : NumberSelector = {
+    def getSelector(): NumberSelector = {
       if (selector.equals("random")) new RandomSelector
       else new SpecificSelector
     }
@@ -101,17 +102,9 @@ object Zones {
     "PathPoints"
   )(ZipLinePath.apply)
 
-  // monolith, hst, warpgate are ignored for now as the scala code isn't ready to handle them.
   // BFR terminals/doors are ignored as top level elements as sanctuaries have them with no associated building. (repair_silo also has this problem, but currently is ignored in the AmenityExtrator project)
   // Force domes have GUIDs but are currently classed as separate entities. The dome is controlled by sending GOAM 44 / 48 / 52 to the building GUID
-  private val ignoredEntities = Seq(
-    "monolith",
-    "force_dome_dsp_physics",
-    "force_dome_comm_physics",
-    "force_dome_cryo_physics",
-    "force_dome_tech_physics",
-    "force_dome_amp_physics"
-  )
+  private val ignoredEntities = Seq("monolith")
 
   private val towerTypes    = Seq("tower_a", "tower_b", "tower_c")
   private val facilityTypes = Seq("amp_station", "cryo_facility", "comm_station", "comm_station_dsp", "tech_plant")
@@ -121,12 +114,21 @@ object Zones {
     "orbital_building_vs",
     "orbital_building_tr",
     "orbital_building_nc",
+    "vr_training",
+    "vt_air_vehicle",
     "VT_building_vs",
     "VT_building_tr",
     "VT_building_nc",
     "vt_dropship",
     "vt_spawn",
     "vt_vehicle"
+  )
+  private val forceDomeTypes = Seq(
+    "force_dome_dsp_physics",
+    "force_dome_comm_physics",
+    "force_dome_cryo_physics",
+    "force_dome_tech_physics",
+    "force_dome_amp_physics"
   )
   private val cavernBuildingTypes = Seq(
     "ceiling_bldg_a",
@@ -157,7 +159,7 @@ object Zones {
     "vanu_vehicle_station"
   )
   private val basicTerminalTypes =
-    Seq("order_terminal", "spawn_terminal", "cert_terminal", "order_terminal", "vanu_equipment_term")
+    Seq("order_terminal", "spawn_terminal", "cert_terminal", "order_terminal", "vanu_equipment_term", "main_terminal")
   private val spawnPadTerminalTypes = Seq(
     "ground_vehicle_terminal",
     "air_vehicle_terminal",
@@ -178,23 +180,44 @@ object Zones {
   )
 
   private val doorTypes = Seq(
-    "gr_door_garage_int",
-    "gr_door_int",
-    "gr_door_med",
-    "spawn_tube_door",
     "amp_cap_door",
+    "ancient_door",
+    "ancient_garage_door",
+    "cryo_med_door",
+    "cryo_room_door",
+    "door",
+    "door_airlock",
+    "door_airlock_orb",
     "door_dsp",
+    "door_garage",
+    "door_interior",
+    "door_mb",
+    "door_mb_garage",
+    "door_mb_main",
+    "door_mb_orb",
+    "door_mb_side",
+    "door_nc_garage",
+    "door_nc_rotating",
+    "door_ncside",
+    "door_orbspawn",
+    "door_spawn_mb",
+    "garage_door",
+    "gr_door_airlock",
     "gr_door_ext",
     "gr_door_garage_ext",
+    "gr_door_garage_int",
+    "gr_door_int",
     "gr_door_main",
     "gr_door_mb_ext",
     "gr_door_mb_int",
     "gr_door_mb_lrg",
     "gr_door_mb_obsd",
     "gr_door_mb_orb",
-    "door_spawn_mb",
-    "ancient_door",
-    "ancient_garage_door"
+    "gr_door_med",
+    "main_door",
+    "shield_door",
+    "spawn_tube_door",
+    "spawn_tube_door_coffin"
   )
 
   lazy val zoneMaps: Seq[ZoneMap] = {
@@ -228,7 +251,9 @@ object Zones {
       }
       .map {
         case (info, data, zplData) =>
-          val zoneMap = new ZoneMap(info.value)
+          val mapid = info.value
+          val zoneMap = new ZoneMap(mapid)
+          val expectsACavernZone = info.value.startsWith("ugd")
 
           zoneMap.checksum = info.checksum
           zoneMap.scale = info.scale
@@ -271,17 +296,42 @@ object Zones {
                   structure.guid,
                   structure.mapId.get,
                   FoundationBuilder(
-                    WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ), GlobalDefinitions.hst)
+                    WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ), GlobalDefinitions.hst, WarpGateLogic)
                   )
                 )
-              case objectType if warpGateTypes.contains(objectType) =>
+              case objectType @ "warpgate_cavern" if warpGateTypes.contains(objectType) =>
                 zoneMap.addLocalBuilding(
                   structure.objectName,
                   structure.guid,
                   structure.mapId.get,
-                  FoundationBuilder(WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ)))
+                  FoundationBuilder(
+                    WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ), GlobalDefinitions.warpgate_cavern, WarpGateLogic)
+                  )
+                )
+              case objectType @ "warpgate_small" if warpGateTypes.contains(objectType) =>
+                zoneMap.addLocalBuilding(
+                  structure.objectName,
+                  structure.guid,
+                  structure.mapId.get,
+                  FoundationBuilder(
+                    WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ), GlobalDefinitions.warpgate_small, WarpGateLogic)
+                  )
+                )
+              case objectType @ "warpgate" if warpGateTypes.contains(objectType) =>
+                zoneMap.addLocalBuilding(
+                  structure.objectName,
+                  structure.guid,
+                  structure.mapId.get,
+                  FoundationBuilder(WarpGate.Structure(Vector3(structure.absX, structure.absY, structure.absZ), GlobalDefinitions.warpgate, WarpGateLogic))
                 )
               case _ =>
+                val logic: BuildingLogic = if (expectsACavernZone) {
+                  CavernFacilityLogic
+                } else if (structureType == StructureType.Facility) {
+                  MajorFacilityLogic
+                } else {
+                  FacilityLogic
+                }
                 zoneMap.addLocalBuilding(
                   structure.objectName,
                   structure.guid,
@@ -291,14 +341,14 @@ object Zones {
                       structureType,
                       Vector3(structure.absX, structure.absY, structure.absZ),
                       Vector3(0f, 0f, structure.yaw),
-                      structure.objectDefinition.asInstanceOf[BuildingDefinition]
+                      structure.objectDefinition.asInstanceOf[BuildingDefinition],
+                      logic
                     )
                   )
                 )
                 if (facilityTypes.contains(structure.objectType)) {
                   //major overworld facilities have an intrinsic terminal that occasionally recharges ancient weapons
                   val buildingGuid = structure.guid
-                  val terminalGuid = buildingGuid + 1
                   zoneMap.addLocalObject(
                     buildingGuid + 1,
                     ProximityTerminal.Constructor(
@@ -307,13 +357,22 @@ object Zones {
                     ),
                     owningBuildingGuid = buildingGuid
                   )
+                  //health module slowly heals friendly players in the soi
+                  zoneMap.addLocalObject(
+                    buildingGuid + 2,
+                    ProximityTerminal.Constructor(
+                      structure.position,
+                      GlobalDefinitions.medical_terminal_healing_module
+                    ),
+                    owningBuildingGuid = buildingGuid
+                  )
                 }
             }
             val filteredZoneEntities =
               data.filter { _.owner.contains(structure.id) } ++
               {
-                val structurePosition = structure.position
                 if (structure.objectType.startsWith("orbital_building_")) {
+                  val structurePosition = structure.position
                   data.filter { entity =>
                     entity.objectType.startsWith("bfr_") &&
                     Vector3.DistanceSquared(entity.position, structurePosition) < 160000f
@@ -333,26 +392,34 @@ object Zones {
 
           createObjects(
             zoneMap,
-            zoneObjects.filterNot { _.objectType.startsWith("bfr_") },
+            zoneObjects.filterNot { obj => obj.objectType.startsWith("bfr_") || forceDomeTypes.contains(obj.objectType) },
             ownerGuid = 0,
             None,
             turretWeaponGuid
           )
+          //force dome physics objects have no owner
+          //for our benefit, we can attach them as amenities to the zone's capitol facility
+          zoneObjects
+            .find { obj => forceDomeTypes.contains(obj.objectType) }
+            .foreach { forceDome =>
+              structures
+                .find { structure => Building.Capitols.contains(structure.objectName) }
+                .foreach { structure =>
+                  val definition = DefinitionUtil.fromString(forceDome.objectType).asInstanceOf[ForceDomeDefinition]
+                  zoneMap.addLocalObject(
+                    forceDome.guid,
+                    ForceDomePhysics.Constructor(definition),
+                    owningBuildingGuid = structure.guid
+                  )
+                }
+            }
 
-          (Projectile.baseUID until Projectile.rangeUID) foreach {
-            zoneMap.addLocalObject(_, LocalProjectile.Constructor)
-          }
-          40150 until 40450 foreach {
-            zoneMap.addLocalObject(_, LocalLockerItem.Constructor)
-          }
-
-          lattice.asObject.get(info.value).foreach { obj =>
+          lattice.asObject.get(mapid).foreach { obj =>
             obj.asArray.get.foreach { entry =>
               val arr = entry.asArray.get
               zoneMap.addLatticeLink(arr(0).asString.get, arr(1).asString.get)
             }
           }
-
           zoneMap
       }
       .seq
@@ -393,14 +460,6 @@ object Zones {
             owningBuildingGuid = ownerGuid
           )
 
-        case "gr_door_mb_orb" =>
-          zoneMap
-            .addLocalObject(
-              obj.guid,
-              Door.Constructor(obj.position, GlobalDefinitions.gr_door_mb_orb),
-              owningBuildingGuid = ownerGuid
-            )
-
         case doorType if doorType.equals("door_spawn_mb") || doorType.equals("spawn_tube_door") =>
           zoneMap.addLocalObject(
             obj.guid,
@@ -413,23 +472,29 @@ object Zones {
 
         case objectType if doorTypes.contains(objectType) =>
           zoneMap
-            .addLocalObject(obj.guid, Door.Constructor(obj.position), owningBuildingGuid = ownerGuid)
+            .addLocalObject(
+              obj.guid,
+              Door.Constructor(
+                obj.position,
+                DefinitionUtil.fromString(objectType).asInstanceOf[DoorDefinition]
+              ),
+              owningBuildingGuid = ownerGuid
+            )
 
         case "locker_cryo" | "locker_med" | "mb_locker" =>
           zoneMap
             .addLocalObject(obj.guid, Locker.Constructor(obj.position), owningBuildingGuid = ownerGuid)
 
         case "lock_external" | "lock_garage" | "lock_small" =>
-          val closestDoor = doors.minBy(d => Vector3.Distance(d.position, obj.position))
-
-          // Since tech plant garage locks are the only type where the lock does not face the same direction as the door we need to apply an offset for those, otherwise the door won't operate properly when checking inside/outside angles.
-          val yawOffset = if (obj.objectType == "lock_garage") 90 else 0
-
+          val position = obj.position
+          val closestDoor = doors.minBy(d => Vector3.Distance(d.position, position))
           // Ignore duplicate lock objects, for example Sobek (and other Dropship Centers) CC door has 2 locks stacked on top of each other
           if (!zoneMap.doorToLock.keys.iterator.contains(closestDoor.guid)) {
+            // Since tech plant garage locks are the only type where the lock does not face the same direction as the door we need to apply an offset for those, otherwise the door won't operate properly when checking inside/outside angles.
+            val yawOffset = if (obj.objectType == "lock_garage") 90 else 0
             zoneMap.addLocalObject(
               obj.guid,
-              IFFLock.Constructor(obj.position, Vector3(0, 0, obj.yaw + yawOffset)),
+              IFFLock.Constructor(position, Vector3.z(obj.yaw + yawOffset)),
               owningBuildingGuid = ownerGuid,
               doorGuid = closestDoor.guid
             )
@@ -528,7 +593,8 @@ object Zones {
           )
 
         case "adv_med_terminal" | "repair_silo" | "pad_landing_frame" | "pad_landing_tower_frame" | "medical_terminal" |
-            "crystals_health_a" | "crystals_health_b" =>
+            "crystals_health_a" | "crystals_health_b" | "crystals_repair_a" | "crystals_repair_b" | "crystals_vehicle_a" |
+            "crystals_vehicle_b" | "crystals_energy_a" | "crystals_energy_b" | "medical_terminal_healing_module" =>
           zoneMap.addLocalObject(
             obj.guid,
             ProximityTerminal
@@ -578,13 +644,36 @@ object Zones {
                 ProximityTerminal.Constructor(obj.position, GlobalDefinitions.recharge_terminal),
                 owningBuildingGuid = ownerGuid
               )
+            case "crystals_vehicle_a" | "crystals_vehicle_b" =>
+              zoneMap.addLocalObject(
+                obj.guid + 1,
+                ProximityTerminal.Constructor(obj.position, GlobalDefinitions.recharge_terminal),
+                owningBuildingGuid = ownerGuid
+              )
+            case "crystals_energy_a" | "crystals_energy_b" =>
+              zoneMap.addLocalObject(
+                obj.guid + 2000,
+                ProximityTerminal.Constructor(obj.position, GlobalDefinitions.crystals_energy),
+                owningBuildingGuid = ownerGuid
+              )
             case _ => ;
           }
 
-        case "manned_turret" | "vanu_sentry_turret" =>
+        case "manned_turret" =>
           zoneMap.addLocalObject(
             obj.guid,
             FacilityTurret.Constructor(
+              obj.position,
+              obj.objectDefinition.asInstanceOf[FacilityTurretDefinition]
+            ),
+            owningBuildingGuid = ownerGuid
+          )
+          zoneMap.linkTurretToWeapon(obj.guid, turretWeaponGuid.getAndIncrement())
+
+        case "vanu_sentry_turret" =>
+          zoneMap.addLocalObject(
+            obj.guid,
+            VanuSentry.Constructor(
               obj.position,
               obj.objectDefinition.asInstanceOf[FacilityTurretDefinition]
             ),
@@ -603,7 +692,7 @@ object Zones {
 
           zoneMap.addLocalObject(
             closestTerminal.guid,
-            Terminal.Constructor(closestTerminal.position, GlobalDefinitions.implant_terminal_interface),
+            ImplantTerminalInterface.Constructor(closestTerminal.position, GlobalDefinitions.implant_terminal_interface),
             owningBuildingGuid = ownerGuid
           )
 
@@ -647,13 +736,22 @@ object Zones {
             )
           zoneMap.linkShuttleToBay(obj.guid)
 
+        case "spawn_pad" | "spawn_zone" =>
+          zoneMap
+            .addLocalObject(obj.guid, VirtualTrainingTeleporter.Constructor(obj.position))
+
         case _ => ()
       }
-
     }
   }
 
   lazy val zones: Seq[Zone] = {
+    //intercontinental lattice
+    val res  = Source.fromResource(s"zonemaps/lattice.json")
+    val json = res.mkString
+    res.close()
+    val intercontinentalLattice = parse(json).toOption.get.asObject.get("intercontinental")
+    //guid overrides
     val defaultGuids =
       try {
         val res  = Source.fromResource("guid-pools/default.json")
@@ -676,45 +774,152 @@ object Zones {
           case _: Exception => defaultGuids
         }
 
-      new Zone(info.id, zoneMaps.find(_.name.equals(info.map.value)).get, info.value) {
+      val zone = new Zone(info, zoneMaps.find(_.name.equals(info.map.value)).get) {
         private val addPoolsFunc: () => Unit = addPools(guids, zone = this)
 
         override def SetupNumberPools() : Unit = addPoolsFunc()
 
         override def init(implicit context: ActorContext): Unit = {
+          guids.find { pool => pool.name.equals("projectiles") } match {
+            case Some(pool) =>
+              (pool.start to pool.max).foreach { map.addLocalObject(_, LocalProjectile.Constructor) }
+            case None => ;
+          }
+          guids.find { pool => pool.name.equals("locker-contents") } match {
+            case Some(pool) =>
+              (pool.start to pool.max).foreach { map.addLocalObject(_, LocalLockerItem.Constructor) }
+            case None => ;
+          }
           super.init(context)
 
           if (!info.id.startsWith("tz")) {
-            this.HotSpotCoordinateFunction = Zones.HotSpots.standardRemapping(info.map.scale, 80, 80)
+            this.HotSpotCoordinateFunction = Zones.HotSpots.standardRemapping(info.map.scale, info.map.hotSpotSpan, info.map.hotSpotSpan)
             this.HotSpotTimeFunction = Zones.HotSpots.standardTimeRules
-            Zones.initZoneAmenities(this)
+            Zones.initZoneAmenities(zone = this)
+          } else {
+            Zones.initZoneAmenities(zone = this)
           }
 
+          //special conditions
+          //1. sanctuaries and VR training zones are completely owned by a single faction
+          //2. set up the third warp gate on sanctuaries to be a broadcast warp gate
+          //3. set up sanctuary-linked warp gates on "home continents" (the names make no sense anymore, don't even ask)
+          //4. assign the caverns internally
+          val bldgs = Buildings.values
           info.id match {
-            case "home1" =>
-              this.Buildings.values.foreach(_.Faction = PlanetSideEmpire.NC)
-            case "home2" =>
-              this.Buildings.values.foreach(_.Faction = PlanetSideEmpire.TR)
-            case "home3" =>
-              this.Buildings.values.foreach(_.Faction = PlanetSideEmpire.VS)
-            case zoneid if zoneid.startsWith("c") =>
-              this.map.cavern = true
-            case _ => ;
-          }
-
-          // Set up warp gate factions aka "sanctuary link". Those names make no sense anymore, don't even ask.
-          this.Buildings.foreach {
-            case (_, building) if building.Name.startsWith("WG") =>
-              building.Name match {
-                case "WG_Amerish_to_Solsar" | "WG_Esamir_to_VSSanc"    => building.Faction = PlanetSideEmpire.NC
-                case "WG_Hossin_to_VSSanc" | "WG_Solsar_to_Amerish"    => building.Faction = PlanetSideEmpire.TR
-                case "WG_Ceryshen_to_Hossin" | "WG_Forseral_to_Solsar" => building.Faction = PlanetSideEmpire.VS
-                case _                                                 => ;
+            case "z1" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Solsar_to_Amerish", PlanetSideEmpire.TR)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z2" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Hossin_to_VSSanc", PlanetSideEmpire.TR)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z3" =>
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z4" =>
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z5" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Forseral_to_Solsar", PlanetSideEmpire.VS)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z6" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Ceryshen_to_Hossin", PlanetSideEmpire.VS)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z7" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Esamir_to_VSSanc", PlanetSideEmpire.NC)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z8" =>
+              bldgs.filter(_.Name.startsWith("WG_")).map {
+                case gate: WarpGate => gate.Active = false
               }
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z9" =>
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "z10" =>
+              setWarpGateToFactionOwnedAndBroadcast(bldgs, name = "WG_Amerish_to_Solsar", PlanetSideEmpire.NC)
+              deactivateGeoWarpGateOnContinent(bldgs)
+            case "home1" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.NC)
+              bldgs.filter(_.Name.startsWith("WG_")).map {
+                case gate: WarpGate => gate.AllowBroadcastFor = PlanetSideEmpire.NC
+              }
+            case "home2" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.TR)
+              bldgs.filter(_.Name.startsWith("WG_")).map {
+                case gate: WarpGate => gate.AllowBroadcastFor = PlanetSideEmpire.TR
+              }
+            case "home3" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.VS)
+              bldgs.filter(_.Name.startsWith("WG_")).map {
+                case gate: WarpGate => gate.AllowBroadcastFor = PlanetSideEmpire.VS
+              }
+            case "tzshtr" | "tzdrtr" | "tzcotr" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.TR)
+            case "tzshnc" | "tzdrnc" | "tzconc" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.NC)
+            case "tzshvs" | "tzdrvs" | "tzcovs" =>
+              bldgs.foreach(_.Faction = PlanetSideEmpire.VS)
+            case "i4" =>
+              bldgs.find(_.Name.equals("Map96_Gate_Three")).map {
+                case gate: WarpGate => gate.Active = false
+              }
+            case zoneId if zoneId.startsWith("c") =>
+              deactivateGeoWarpGateOnContinent(bldgs)
             case _ => ;
           }
         }
       }
+      val map = zone.map
+      val zoneid = zone.id
+      intercontinentalLattice.foreach { obj =>
+        obj.asArray.get.foreach { entry =>
+          val arr = entry.asArray.get
+          val arrHead = arr.head.asString.get
+          if (arrHead.startsWith(s"$zoneid/")) {
+            map.addLatticeLink(arrHead, arr(1).asString.get)
+          }
+        }
+      }
+      zone
+    }
+  }
+
+  lazy val cavernLattice: Map[String, Iterable[Iterable[String]]] = {
+    val res  = Source.fromResource(s"zonemaps/lattice.json")
+    val json = res.mkString
+    res.close()
+    val jsonObj = parse(json).toOption.get.asObject
+    val keys = jsonObj match {
+      case Some(jsonToObject) => jsonToObject.keys.filter { _.startsWith("caverns-") }
+      case _ => Nil
+    }
+    val pairs = keys.map { key =>
+      (
+        key,
+        jsonObj.get(key).map { obj =>
+          obj.asArray.get.map { entry =>
+            val array = entry.asArray.get
+            List(array.head.asString.get, array.last.asString.get)
+          }
+        }.get
+      )
+    }
+    pairs.toMap[String, Iterable[Iterable[String]]]
+  }
+
+  private def deactivateGeoWarpGateOnContinent(buildings: Iterable[Building]): Unit = {
+    buildings.filter(_.Name.startsWith(s"GW_")).map {
+      case gate: WarpGate => gate.Active = false
+    }
+  }
+
+  private def setWarpGateToFactionOwnedAndBroadcast(
+                                                      buildings: Iterable[Building],
+                                                      name: String,
+                                                      faction: PlanetSideEmpire.Value
+                                                    ) : Unit = {
+    buildings.find(_.Name.equals(name)).map {
+      case gate: WarpGate =>
+        gate.Faction = faction
+        gate.AllowBroadcastFor = faction
     }
   }
 
@@ -743,7 +948,6 @@ object Zones {
             if wg.Definition == GlobalDefinitions.warpgate || wg.Definition == GlobalDefinitions.warpgate_small =>
           wg.Active = true
           wg.Faction = PlanetSideEmpire.NEUTRAL
-          wg.Broadcast = true
         case geowarp: WarpGate
             if geowarp.Definition == GlobalDefinitions.warpgate_cavern || geowarp.Definition == GlobalDefinitions.hst =>
           geowarp.Faction = PlanetSideEmpire.NEUTRAL
@@ -818,7 +1022,8 @@ object Zones {
   }
 
   object HotSpots {
-    import net.psforever.objects.ballistics.SourceEntry
+
+    import net.psforever.objects.sourcing.SourceEntry
     import net.psforever.objects.zones.MapScale
     import net.psforever.types.Vector3
 
@@ -889,7 +1094,6 @@ object Zones {
       */
     def standardTimeRules(defender: SourceEntry, attacker: SourceEntry): FiniteDuration = {
       import net.psforever.objects.GlobalDefinitions
-      import net.psforever.objects.ballistics._
       if (attacker.Faction == defender.Faction) {
         0 seconds
       } else {
@@ -899,10 +1103,12 @@ object Zones {
             60 seconds
           case _: VehicleSource =>
             60 seconds
-          case t: ObjectSource if t.Definition == GlobalDefinitions.manned_turret =>
-            60 seconds
           case _: DeployableSource =>
             60 seconds
+          case _: TurretSource =>
+            60 seconds
+          case g if g.Definition == GlobalDefinitions.generator =>
+            90 seconds
           case _ =>
             0 seconds
         }

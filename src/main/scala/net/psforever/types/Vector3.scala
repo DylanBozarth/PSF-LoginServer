@@ -52,6 +52,17 @@ final case class Vector3(x: Float, y: Float, z: Float) {
   }
 
   /**
+    * Operator for multiplication of vector elements.
+    * This applies a scaling to each element of one vector by the same element of the other.
+    * The application of this overload is "vector ** v".
+    * @param v the per-element scalars as a `Vector3` object
+    * @return a new `Vector3` object
+    */
+  def **(v: Vector3): Vector3 = {
+    Vector3(x * v.x, y * v.y, z * v.z)
+  }
+
+  /**
     * Operator for returning the ground-planar coordinates
     * and ignoring the perpendicular distance from the world floor.
     * The application of this definition is "vector.xy" or "vector xy."
@@ -89,6 +100,8 @@ final case class Vector3(x: Float, y: Float, z: Float) {
 
 object Vector3 {
   final val Zero: Vector3 = Vector3(0f, 0f, 0f)
+
+  def unapply(v: Vector3): Option[(Float, Float, Float)] = Some((v.x, v.y, v.z))
 
   private def closeToInsignificance(d: Float, epsilon: Float = 10f): Float = {
     val ulp = math.ulp(epsilon)

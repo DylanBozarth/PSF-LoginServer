@@ -3,10 +3,10 @@ package net.psforever.objects.vehicles
 
 import enumeratum.values.{IntEnum, IntEnumEntry}
 import net.psforever.objects.entity.IdentifiableEntity
-import net.psforever.objects.{GlobalDefinitions, PlanetSideGameObject, Vehicle}
+import net.psforever.objects.{Default, GlobalDefinitions, PlanetSideGameObject, Vehicle}
 import net.psforever.objects.equipment.{Equipment, JammableUnit}
 import net.psforever.packet.PlanetSideGamePacket
-import net.psforever.packet.game.{ComponentDamageField, ComponentDamageMessage, GenericObjectActionMessage}
+import net.psforever.packet.game.packets.{ComponentDamageField, ComponentDamageMessage, GenericObjectActionMessage}
 import net.psforever.types.{PlanetSideGUID, SubsystemComponent}
 
 //data
@@ -18,7 +18,7 @@ sealed abstract class VehicleSubsystemConditionModifier(
                                                        ) extends IntEnumEntry
 
 object VehicleSubsystemConditionModifier extends IntEnum[VehicleSubsystemConditionModifier] {
-  val values = findValues
+  val values: IndexedSeq[VehicleSubsystemConditionModifier] = findValues
 
   case object Off extends VehicleSubsystemConditionModifier(value = 1065353216, multiplier = 0f, addend = 0)
 
@@ -155,7 +155,7 @@ trait VehicleWeaponStatus
   override def getMessageTargetId(vehicle: Vehicle): PlanetSideGUID = {
     getMessageTarget(vehicle) match {
       case Some(e) => e.GUID
-      case None    => PlanetSideGUID(0)
+      case None    => Default.GUID0
     }
   }
 

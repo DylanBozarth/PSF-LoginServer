@@ -1,24 +1,28 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects
 
+import net.psforever.objects.avatar.interaction.{InteractWithForceDomeProtection, TriggerOnPlayerRule, WithEntrance, WithGantry, WithLava, WithWater}
 import net.psforever.objects.avatar.{Avatar, LoadoutManager, SpecialCarry}
 import net.psforever.objects.ballistics.InteractWithRadiationClouds
-import net.psforever.objects.ce.{Deployable, InteractWithMines}
+import net.psforever.objects.ce.{Deployable, InteractWithMines, InteractWithTurrets}
 import net.psforever.objects.definition.{AvatarDefinition, ExoSuitDefinition, SpecialExoSuitDefinition}
 import net.psforever.objects.equipment.{Equipment, EquipmentSize, EquipmentSlot, JammableUnit}
 import net.psforever.objects.inventory.{Container, GridInventory, InventoryItem}
-import net.psforever.objects.serverobject.PlanetSideServerObject
+import net.psforever.objects.serverobject.{PlanetSideServerObject, environment}
 import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.aura.AuraContainer
-import net.psforever.objects.serverobject.environment.InteractWithEnvironment
+import net.psforever.objects.serverobject.environment.interaction.common.{WithDeath, WithMovementTrigger}
+import net.psforever.objects.serverobject.interior.InteriorAwareFromInteraction
 import net.psforever.objects.serverobject.mount.MountableEntity
 import net.psforever.objects.vital.resistance.ResistanceProfile
-import net.psforever.objects.vital.Vitality
+import net.psforever.objects.vital.{HealFromEquipment, InGameActivity, RepairFromEquipment, Vitality}
+import net.psforever.objects.vital.damage.DamageProfile
 import net.psforever.objects.vital.interaction.DamageInteraction
 import net.psforever.objects.vital.resolution.DamageResistanceModel
-import net.psforever.objects.zones.blockmap.{BlockMapEntity, SectorPopulation}
-import net.psforever.objects.zones.{InteractsWithZone, ZoneAware, Zoning}
-import net.psforever.types.{PlanetSideGUID, _}
+import net.psforever.objects.zones.blockmap.BlockMapEntity
+import net.psforever.objects.zones.interaction.InteractsWithZone
+import net.psforever.objects.zones.{ZoneAware, Zoning}
+import net.psforever.types._
 
 import scala.annotation.tailrec
 import scala.util.{Success, Try}
@@ -33,10 +37,20 @@ class Player(var avatar: Avatar)
     with Container
     with JammableUnit
     with ZoneAware
+    with InteriorAwareFromInteraction
     with AuraContainer
     with MountableEntity {
-  interaction(new InteractWithEnvironment())
-  interaction(new InteractWithMinesUnlessSpectating(obj = this, range = 10))
+  interaction(new InteractWithForceDomeProtection())
+  interaction(environment.interaction.InteractWithEnvironment(Seq(
+    new WithEntrance(),
+    new WithWater(avatar.name),
+    new WithLava(),
+    new WithDeath(),
+    new WithGantry(avatar.name),
+    new WithMovementTrigger()
+  )))
+  interaction(new InteractWithMines(range = 10, TriggerOnPlayerRule))
+  interaction(new InteractWithTurrets())
   interaction(new InteractWithRadiationClouds(range = 10f, Some(this)))
 
   private var backpack: Boolean = false
@@ -62,22 +76,30 @@ class Player(var avatar: Avatar)
   private var jumping: Boolean            = false
   private var cloaked: Boolean            = false
   private var afk: Boolean                = false
-  private var zoning: Zoning.Method.Value = Zoning.Method.None
+  private var zoning: Zoning.Method       = Zoning.Method.None
 
   private var vehicleSeated: Option[PlanetSideGUID] = None
 
   Continent = "home2" //the zone id
 
   var spectator: Boolean                 = false
+  var bops: Boolean                      = false
   var silenced: Boolean                  = false
   var death_by: Int                      = 0
-  var lastSeenStreamMessage: Array[Long] = Array.fill[Long](65535)(0L)
   var lastShotSeq_time: Int              = -1
+  var outfit_name: String                = ""
+  var outfit_id: Long                    = 0
+  var outfit_window_open: Boolean        = false
+  var outfit_list_open: Boolean          = false
+  var maxAutoRunEnabled: Boolean         = false
+  var protectedWhileZoning: Boolean      = false
 
   /** From PlanetsideAttributeMessage */
   var PlanetsideAttribute: Array[Long] = Array.ofDim(120)
 
   val squadLoadouts = new LoadoutManager(10)
+
+  var resistArmMotion: (Player,Int)=>Boolean = Player.neverRestrict
 
   //init
   Health = 0       //player health is artificially managed as a part of their lifecycle; start entity as dead
@@ -108,6 +130,7 @@ class Player(var avatar: Avatar)
       Health = Definition.DefaultHealth
       Armor = MaxArmor
       Capacitor = 0
+      avatar.scorecard.respawn()
       released = false
     }
     isAlive
@@ -122,13 +145,16 @@ class Player(var avatar: Avatar)
   def Revive: Boolean = {
     Destroyed = false
     Health = Definition.DefaultHealth
+    avatar.scorecard.revive()
     released = false
     true
   }
 
   def Release: Boolean = {
-    released = true
-    backpack = !isAlive
+    if (!released) {
+      released = true
+      backpack = !isAlive
+    }
     true
   }
 
@@ -176,8 +202,8 @@ class Player(var avatar: Avatar)
     capacitorState
   }
 
-  def CapacitorLastUsedMillis    = capacitorLastUsedMillis
-  def CapacitorLastChargedMillis = capacitorLastChargedMillis
+  def CapacitorLastUsedMillis: Long    = capacitorLastUsedMillis
+  def CapacitorLastChargedMillis: Long = capacitorLastChargedMillis
 
   def VisibleSlots: Set[Int] =
     if (exosuit.SuitType == ExoSuitType.MAX) {
@@ -212,8 +238,12 @@ class Player(var avatar: Avatar)
   def HolsterItems(): List[InventoryItem] = holsters
     .zipWithIndex
     .collect {
-      case (slot: EquipmentSlot, index: Int) if slot.Equipment.nonEmpty => InventoryItem(slot.Equipment.get, index)
-    }.toList
+      case (slot: EquipmentSlot, index: Int) =>
+        slot.Equipment match {
+          case Some(item) => Some(InventoryItem(item, index))
+          case None => None
+        }
+    }.flatten.toList
 
   def Inventory: GridInventory = inventory
 
@@ -249,7 +279,7 @@ class Player(var avatar: Avatar)
     }
   }
 
-  def FreeHand = freeHand
+  def FreeHand: EquipmentSlot = freeHand
 
   def FreeHand_=(item: Option[Equipment]): Option[Equipment] = {
     if (freeHand.Equipment.isEmpty || item.isEmpty) {
@@ -309,6 +339,18 @@ class Player(var avatar: Avatar)
     }
   }
 
+  def ResistArmMotion(func: (Player,Int)=>Boolean): Unit = {
+    resistArmMotion = func
+  }
+
+  def TestArmMotion(): Boolean = {
+    resistArmMotion(this, drawnSlot)
+  }
+
+  def TestArmMotion(slot: Int): Boolean = {
+    resistArmMotion(this, slot)
+  }
+
   def DrawnSlot: Int = drawnSlot
 
   def DrawnSlot_=(slot: Int): Int = {
@@ -335,15 +377,15 @@ class Player(var avatar: Avatar)
     ChangeSpecialAbility()
   }
 
-  def Subtract = exosuit.Subtract
+  def Subtract: DamageProfile = exosuit.Subtract
 
-  def ResistanceDirectHit = exosuit.ResistanceDirectHit
+  def ResistanceDirectHit: Int = exosuit.ResistanceDirectHit
 
-  def ResistanceSplash = exosuit.ResistanceSplash
+  def ResistanceSplash: Int = exosuit.ResistanceSplash
 
-  def ResistanceAggravated = exosuit.ResistanceAggravated
+  def ResistanceAggravated: Int = exosuit.ResistanceAggravated
 
-  def RadiationShielding = exosuit.RadiationShielding
+  def RadiationShielding: Float = exosuit.RadiationShielding
 
   def FacingYawUpper: Float = facingYawUpper
 
@@ -404,12 +446,13 @@ class Player(var avatar: Avatar)
   def UsingSpecial_=(state: SpecialExoSuitDefinition.Mode.Value): SpecialExoSuitDefinition.Mode.Value =
     usingSpecial(state)
 
+  //noinspection ScalaUnusedSymbol
   private def DefaultUsingSpecial(state: SpecialExoSuitDefinition.Mode.Value): SpecialExoSuitDefinition.Mode.Value =
     SpecialExoSuitDefinition.Mode.Normal
 
   private def UsingAnchorsOrOverdrive(
-      state: SpecialExoSuitDefinition.Mode.Value
-  ): SpecialExoSuitDefinition.Mode.Value = {
+                                       state: SpecialExoSuitDefinition.Mode.Value
+                                     ): SpecialExoSuitDefinition.Mode.Value = {
     import SpecialExoSuitDefinition.Mode._
     val curr = UsingSpecial
     val next = if (curr == Normal) {
@@ -514,22 +557,37 @@ class Player(var avatar: Avatar)
 
   def Carrying: Option[SpecialCarry] = carrying
 
+  //noinspection ScalaUnusedSymbol
   def Carrying_=(item: SpecialCarry): Option[SpecialCarry] = {
-    Carrying
+    Carrying_=(Some(item))
   }
 
+  //noinspection ScalaUnusedSymbol
   def Carrying_=(item: Option[SpecialCarry]): Option[SpecialCarry] = {
+    carrying = item
     Carrying
   }
 
-  def ZoningRequest: Zoning.Method.Value = zoning
+  def ZoningRequest: Zoning.Method = zoning
 
-  def ZoningRequest_=(request: Zoning.Method.Value): Zoning.Method.Value = {
+  def ZoningRequest_=(request: Zoning.Method): Zoning.Method = {
     zoning = request
     ZoningRequest
   }
 
-  def DamageModel = exosuit.asInstanceOf[DamageResistanceModel]
+  override def CanDamage: Boolean = {
+    death_by < 1 && super.CanDamage
+  }
+
+  def DamageModel: DamageResistanceModel = exosuit.asInstanceOf[DamageResistanceModel]
+
+  override def GetContributionDuringPeriod(list: List[InGameActivity], duration: Long): List[InGameActivity] = {
+    val earliestEndTime = System.currentTimeMillis() - duration
+    History.collect {
+      case heal: HealFromEquipment if heal.amount > 0 && heal.time > earliestEndTime         => heal
+      case repair: RepairFromEquipment if repair.amount > 0 && repair.time > earliestEndTime => repair
+    }
+  }
 
   def canEqual(other: Any): Boolean = other.isInstanceOf[Player]
 
@@ -575,6 +633,8 @@ object Player {
     }
   }
 
+  case object Revive
+
   def apply(core: Avatar): Player = {
     new Player(core)
   }
@@ -585,27 +645,27 @@ object Player {
     player.Inventory.Resize(eSuit.InventoryScale.Width, eSuit.InventoryScale.Height)
     player.Inventory.Offset = eSuit.InventoryOffset
     //holsters
-    (0 until 5).foreach(index => { player.Slot(index).Size = eSuit.Holster(index) })
+    (0 until 5).foreach { index => player.Slot(index).Size = eSuit.Holster(index) }
   }
 
   def Respawn(player: Player): Player = {
     if (player.Release) {
       val obj = new Player(player.avatar)
       obj.Continent = player.Continent
+      obj.death_by = player.death_by
+      obj.silenced = player.silenced
+      obj.allowInteraction = player.allowInteraction
+      obj.avatar.scorecard.respawn()
+      obj.outfit_name = player.outfit_name
+      obj.outfit_id = player.outfit_id
       obj
     } else {
       player
     }
   }
-}
 
-private class InteractWithMinesUnlessSpectating(
-                                                 private val obj: Player,
-                                                 override val range: Float
-                                               ) extends InteractWithMines(range) {
-  override def interaction(sector: SectorPopulation, target: InteractsWithZone): Unit = {
-    if (!obj.spectator) {
-      super.interaction(sector, target)
-    }
+  //noinspection ScalaUnusedSymbol
+  def neverRestrict(player: Player, slot: Int): Boolean = {
+    false
   }
 }

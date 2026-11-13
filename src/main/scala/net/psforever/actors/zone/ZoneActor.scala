@@ -1,21 +1,29 @@
 package net.psforever.actors.zone
 
-import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy}
-import akka.actor.typed.scaladsl.{AbstractBehavior, ActorContext, Behaviors}
-import net.psforever.objects.ballistics.SourceEntry
+import akka.actor.typed.{ActorRef, Behavior, PostStop, SupervisorStrategy}
+import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import net.psforever.objects.ce.Deployable
 import net.psforever.objects.equipment.Equipment
-import net.psforever.objects.serverobject.structures.{Building, StructureType}
+import net.psforever.objects.serverobject.structures.{StructureType, WarpGate}
 import net.psforever.objects.zones.Zone
 import net.psforever.objects.zones.blockmap.{BlockMapEntity, SectorGroup}
-import net.psforever.objects.{ConstructionItem, Player, Vehicle}
-import net.psforever.types.{PlanetSideEmpire, PlanetSideGUID, Vector3}
-
-import scala.collection.mutable.ListBuffer
+import net.psforever.objects.{ConstructionItem, PlanetSideGameObject, Player, Vehicle}
+import net.psforever.types.{PlanetSideEmpire, PlanetSideGUID, PlanetSideGeneratorState, Vector3}
 import akka.actor.typed.scaladsl.adapter._
+import net.psforever.objects.avatar.scoring.Kill
+import net.psforever.objects.serverobject.affinity.FactionAffinity
+import net.psforever.objects.serverobject.terminals.capture.CaptureTerminalAwareBehavior
+import net.psforever.objects.serverobject.turret.FacilityTurret
+import net.psforever.objects.sourcing.SourceEntry
+import net.psforever.objects.vital.{InGameActivity, InGameHistory}
+import net.psforever.objects.zones.exp.{ExperienceCalculator, SupportExperienceCalculator}
+import net.psforever.packet.game.packets.{BuildingInfoUpdateMessage, PlanetsideAttributeMessage}
 import net.psforever.util.Database._
 import net.psforever.persistence
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.SendResponse
 
+import scala.collection.mutable
 import scala.util.{Failure, Success}
 import scala.concurrent.ExecutionContext.Implicits.global
 
@@ -23,9 +31,9 @@ object ZoneActor {
   def apply(zone: Zone): Behavior[Command] =
     Behaviors
       .supervise[Command] {
-        Behaviors.setup(context => new ZoneActor(context, zone))
+        Behaviors.setup(context => new ZoneActor(context, zone).onMessage())
       }
-      .onFailure[Exception](SupervisorStrategy.restart)
+      .onFailure[Exception](SupervisorStrategy.resume)
 
   sealed trait Command
 
@@ -69,89 +77,187 @@ object ZoneActor {
   // Once they do, we won't need this anymore
   final case class ZoneMapUpdate() extends Command
 
+  final case class RewardThisDeath(entity: PlanetSideGameObject with FactionAffinity with InGameHistory) extends Command
+
+  final case class RewardOurSupporters(target: SourceEntry, history: Iterable[InGameActivity], kill: Kill, bep: Long) extends Command
+
+  final case class AssignLockedBy(zone: Zone, notifyPlayers: Boolean) extends Command
+
+  final case class BuildingInfoState(msg: BuildingInfoUpdateMessage) extends Command
 }
 
-class ZoneActor(context: ActorContext[ZoneActor.Command], zone: Zone)
-    extends AbstractBehavior[ZoneActor.Command](context) {
+class ZoneActor(
+                 context: ActorContext[ZoneActor.Command],
+                 zone: Zone
+               ) {
 
   import ZoneActor._
   import ctx._
 
   private[this] val log           = org.log4s.getLogger
-  val players: ListBuffer[Player] = ListBuffer()
+  private val players: mutable.ListBuffer[Player] = mutable.ListBuffer()
+  private val experience: ActorRef[ExperienceCalculator.Command] = context.spawnAnonymous(ExperienceCalculator(zone))
+  private val supportExperience: ActorRef[SupportExperienceCalculator.Command] = context.spawnAnonymous(SupportExperienceCalculator(zone))
 
   zone.actor = context.self
   zone.init(context.toClassic)
 
   ctx.run(query[persistence.Building].filter(_.zoneId == lift(zone.Number))).onComplete {
     case Success(buildings) =>
-      var capitol: Option[Building] = None
       buildings.foreach { building =>
         zone.BuildingByMapId(building.localId) match {
+          case Some(_: WarpGate) => ()
+            //warp gates are controlled by game logic and are better off not restored via the database
           case Some(b) =>
-            b.Faction = PlanetSideEmpire(building.factionId)
-            if(b.IsCapitol) {
-              capitol = Some(b)
+            if ((b.Faction = PlanetSideEmpire(building.factionId)) != PlanetSideEmpire.NEUTRAL) {
+              b.Neighbours.getOrElse(Nil).foreach(_.Actor ! BuildingActor.AlertToFactionChange(b))
+              b.CaptureTerminal.collect { terminal =>
+                val msg = CaptureTerminalAwareBehavior.TerminalStatusChanged(terminal, isResecured = true)
+                b.Amenities.collect { case turret: FacilityTurret => turret.Actor ! msg }
+              }
             }
-          case None    =>
+          case None => ()
           // TODO this happens during testing, need a way to not always persist during tests
         }
       }
-      capitol match {
-        case Some(b) => b.ForceDomeActive = BuildingActor.checkForceDomeStatus(b).getOrElse(false)
-        case None    => ;
-      }
+      AssignLockedBy(zone, notifyPlayers=false)
     case Failure(e) => log.error(e.getMessage)
   }
 
-  override def onMessage(msg: Command): Behavior[Command] = {
-    msg match {
+  def onMessage(): Behavior[Command] = {
+    Behaviors.receiveMessagePartial[Command] {
       case GetZone(replyTo) =>
         replyTo ! ZoneResponse(zone)
+        Behaviors.same
 
       case AddPlayer(player) =>
         players.addOne(player)
+        Behaviors.same
 
       case RemovePlayer(player) =>
         players.filterInPlace(p => p.CharId == player.CharId)
+        Behaviors.same
 
       case DropItem(item, position, orientation) =>
         zone.Ground ! Zone.Ground.DropItem(item, position, orientation)
+        Behaviors.same
 
       case PickupItem(guid) =>
         zone.Ground ! Zone.Ground.PickupItem(guid)
+        Behaviors.same
 
-      case BuildDeployable(obj, tool) =>
+      case BuildDeployable(obj, _) =>
         zone.Deployables ! Zone.Deployable.Build(obj)
+        Behaviors.same
 
       case DismissDeployable(obj) =>
         zone.Deployables ! Zone.Deployable.Dismiss(obj)
+        Behaviors.same
 
       case SpawnVehicle(vehicle) =>
         zone.Transport ! Zone.Vehicle.Spawn(vehicle)
+        Behaviors.same
 
       case DespawnVehicle(vehicle) =>
         zone.Transport ! Zone.Vehicle.Despawn(vehicle)
+        Behaviors.same
 
       case AddToBlockMap(target, toPosition) =>
         zone.blockMap.addTo(target, toPosition)
+        Behaviors.same
 
       case UpdateBlockMap(target, toPosition) =>
-        target.updateBlockMapEntry(toPosition)
+        zone.blockMap.move(target, toPosition)
+        Behaviors.same
 
       case RemoveFromBlockMap(target) =>
         zone.blockMap.removeFrom(target)
+        Behaviors.same
 
       case HotSpotActivity(defender, attacker, location) =>
         zone.Activity ! Zone.HotSpot.Activity(defender, attacker, location)
+        Behaviors.same
+
+      case RewardThisDeath(entity) =>
+        experience ! ExperienceCalculator.RewardThisDeath(entity)
+        Behaviors.same
+
+      case RewardOurSupporters(target, history, kill, bep) =>
+        supportExperience ! SupportExperienceCalculator.RewardOurSupporters(target, history, kill, bep)
+        Behaviors.same
 
       case ZoneMapUpdate() =>
         zone.Buildings
-          .filter(_._2.BuildingType == StructureType.Facility)
+          .filter(building =>
+            building._2.BuildingType == StructureType.Facility)
           .values
           .foreach(_.Actor ! BuildingActor.MapUpdate())
-    }
+        Behaviors.same
 
-    this
+      case AssignLockedBy(zone, notifyPlayers) =>
+        AssignLockedBy(zone, notifyPlayers)
+        Behaviors.same
+
+      case BuildingInfoState(msg) =>
+        UpdateBuildingState(msg)
+        Behaviors.same
+    }
+    .receiveSignal {
+      case (_, PostStop) =>
+        Behaviors.same
+    }
+  }
+
+  def AssignLockedBy(zone: Zone, notifyPlayers: Boolean): Unit = {
+    val buildings = zone.Buildings.values
+    val facilities = if (zone.id.startsWith("c")) {
+       buildings.filter(b =>
+        b.Name.startsWith("N") || b.Name.startsWith("S")).toSeq
+      }
+      else {
+        buildings.filter(_.BuildingType == StructureType.Facility).toSeq
+      }
+    val factions = facilities.map(_.Faction).toSet
+    zone.lockedBy =
+      if (factions.size == 1) factions.head
+      else PlanetSideEmpire.NEUTRAL
+    zone.benefitRecipient =
+      if (facilities.nonEmpty && facilities.forall(_.Faction == facilities.head.Faction))
+        facilities.head.Faction
+      else
+        zone.benefitRecipient
+    if (facilities.nonEmpty && notifyPlayers) { zone.NotifyContinentalLockBenefits(zone, facilities.head) }
+  }
+
+  def UpdateBuildingState(msg: BuildingInfoUpdateMessage): Unit = {
+    val buildingOpt = zone.Buildings.collectFirst {
+      case (_, b) if b.MapId == msg.building_map_id => b
+    }
+    buildingOpt.foreach { building =>
+      if (msg.generator_state == PlanetSideGeneratorState.Normal && building.hasCavernLockBenefit) {
+        zone.LocalEvents ! MessageEnvelope(
+          zone.id,
+          SendResponse(PlanetsideAttributeMessage(building.GUID, 67, 1))
+        )
+      }
+      msg.is_hacked match {
+        case true if building.BuildingType == StructureType.Facility && !zone.isACavern =>
+          zone.LocalEvents ! MessageEnvelope(
+            zone.id,
+            SendResponse(PlanetsideAttributeMessage(building.GUID, 67, 0))
+          )
+        case false if building.hasCavernLockBenefit =>
+          zone.LocalEvents ! MessageEnvelope(
+            zone.id,
+            SendResponse(PlanetsideAttributeMessage(building.GUID, 67, 1))
+          )
+        case false if building.BuildingType == StructureType.Facility && !zone.isACavern && !building.hasCavernLockBenefit =>
+          zone.LocalEvents ! MessageEnvelope(
+            zone.id,
+            SendResponse(PlanetsideAttributeMessage(building.GUID, 67, 0))
+          )
+        case _ =>
+      }
+    }
   }
 }

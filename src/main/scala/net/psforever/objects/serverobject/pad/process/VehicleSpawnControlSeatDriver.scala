@@ -1,9 +1,10 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects.serverobject.pad.process
 
-import akka.actor.Props
+import akka.actor.{ActorRef, Props}
 import net.psforever.objects.{Default, Vehicle}
 import net.psforever.objects.serverobject.pad.{VehicleSpawnControl, VehicleSpawnPad}
+import net.psforever.services.base.envelope.MessageEnvelope
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -25,7 +26,7 @@ import scala.concurrent.duration._
 class VehicleSpawnControlSeatDriver(pad: VehicleSpawnPad) extends VehicleSpawnControlBase(pad) {
   def LogId = "-usher"
 
-  val vehicleOverride = context.actorOf(
+  val vehicleOverride: ActorRef = context.actorOf(
     Props(classOf[VehicleSpawnControlServerVehicleOverride], pad),
     s"${context.parent.path.name}-override"
   )
@@ -43,10 +44,10 @@ class VehicleSpawnControlSeatDriver(pad: VehicleSpawnPad) extends VehicleSpawnCo
       val driver  = entry.driver
       val vehicle = entry.vehicle
       //avoid unattended vehicle blocking the pad; user should mount (and does so normally) to reset decon timer
-      vehicle.Actor ! Vehicle.Deconstruct(Some(30 seconds))
+      vehicle.Actor ! Vehicle.Deconstruct(Some(pad.Definition.VehicleCreationDeconstructTime.seconds))
       if (VehicleSpawnControl.validateOrderCredentials(pad, driver, vehicle).isEmpty) {
         trace("driver to be made seated in vehicle")
-        pad.Zone.VehicleEvents ! VehicleSpawnPad.StartPlayerSeatedInVehicle(driver.Name, vehicle, pad)
+        pad.Zone.VehicleEvents ! MessageEnvelope(driver.Name, VehicleSpawnPad.StartPlayerSeatedInVehicle(vehicle, pad))
       } else {
         trace("driver lost; vehicle stranded on pad")
       }
@@ -58,7 +59,7 @@ class VehicleSpawnControlSeatDriver(pad: VehicleSpawnPad) extends VehicleSpawnCo
       if (VehicleSpawnControl.validateOrderCredentials(pad, driver, vehicle).isEmpty &&
           entry.vehicle.PassengerInSeat(entry.driver).contains(0)) {
         trace(s"driver ${entry.driver.Name} has taken the wheel")
-        pad.Zone.VehicleEvents ! VehicleSpawnPad.PlayerSeatedInVehicle(entry.driver.Name, entry.vehicle, pad)
+        pad.Zone.VehicleEvents ! MessageEnvelope(entry.driver.Name, VehicleSpawnPad.PlayerSeatedInVehicle(entry.vehicle, pad))
       } else {
         trace("driver lost, but operations can continue")
       }
@@ -67,7 +68,7 @@ class VehicleSpawnControlSeatDriver(pad: VehicleSpawnPad) extends VehicleSpawnCo
     case msg @ (VehicleSpawnControl.ProcessControl.Reminder | VehicleSpawnControl.ProcessControl.GetNewOrder) =>
       context.parent ! msg
 
-    case _ => ;
+    case _ => ()
   }
 }
 

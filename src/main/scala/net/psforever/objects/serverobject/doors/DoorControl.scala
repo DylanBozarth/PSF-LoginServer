@@ -1,13 +1,16 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects.serverobject.doors
 
-import net.psforever.objects.Player
+import akka.actor.ActorRef
+import net.psforever.objects.{Default, Doors, Player}
 import net.psforever.objects.serverobject.{CommonMessages, PlanetSideServerObject}
 import net.psforever.objects.serverobject.affinity.{FactionAffinity, FactionAffinityBehavior}
 import net.psforever.objects.serverobject.locks.IFFLock
 import net.psforever.objects.serverobject.structures.PoweredAmenityControl
-import net.psforever.services.Service
-import net.psforever.services.local.{LocalAction, LocalResponse, LocalServiceMessage, LocalServiceResponse}
+import net.psforever.services.base.envelope.GenericResponseEnvelope
+import net.psforever.services.base.support.SupportActor
+import net.psforever.services.local.support.{DoorCloseActor, DoorMessage}
+import net.psforever.services.local.{LocalAction, LocalStamp}
 
 /**
   * An `Actor` that handles messages being dispatched to a specific `Door`.
@@ -17,69 +20,71 @@ class DoorControl(door: Door)
   extends PoweredAmenityControl
   with FactionAffinityBehavior.Check {
   def FactionObject: FactionAffinity = door
-  var isLocked: Boolean = false
-  var lockingMechanism: Door.LockingMechanismLogic = DoorControl.alwaysOpen
+
+  private var lockingMechanism: Door.LockingMechanismLogic = DoorControl.alwaysOpen
 
   def commonBehavior: Receive = checkBehavior
     .orElse {
-      case Door.Lock =>
-        isLocked = true
+      case Door.UpdateMechanism(logic) =>
+        lockingMechanism = logic
         if (door.isOpen) {
           val zone = door.Zone
           door.Open = None
-          zone.LocalEvents ! LocalServiceMessage(zone.id, LocalAction.DoorSlamsShut(door))
+          zone.LocalEvents ! DoorMessage(
+            zone.id,
+            LocalAction.DoorCloses(door.GUID),
+            SupportActor.ClearSpecific(List(door), zone)
+          )
         }
-
-      case Door.Unlock =>
-        isLocked = false
-
-      case Door.UpdateMechanism(logic) =>
-        lockingMechanism = logic
     }
 
   def poweredStateLogic: Receive =
     commonBehavior
       .orElse {
+        case CommonMessages.Use(player, Some(customDistance: Float)) =>
+          testToOpenDoor(player, door, customDistance, sender())
+
         case CommonMessages.Use(player, _) =>
-          if (lockingMechanism(player, door) && !isLocked) {
-            openDoor(player)
-          }
+          testToOpenDoor(player, door, door.Definition.initialOpeningDistance, sender())
 
-        case IFFLock.DoorOpenResponse(target: Player) if !isLocked =>
-          openDoor(target)
+        case IFFLock.DoorOpenResponse(target: Player) =>
+          DoorControl.openDoor(target, door)
 
-        case _ => ;
+        case _ => ()
       }
 
   def unpoweredStateLogic: Receive = {
     commonBehavior
       .orElse {
-        case CommonMessages.Use(player, _) if !isLocked =>
+        case CommonMessages.Use(player, _) =>
           //without power, the door opens freely
-          openDoor(player)
+          DoorControl.openDoor(player, door)
 
-        case _ => ;
+        case _ => ()
       }
   }
 
-  def openDoor(player: Player): Unit = {
-    val zone = door.Zone
-    val doorGUID = door.GUID
-    if (!door.isOpen) {
-      //global open
-      door.Open = player
-      zone.LocalEvents ! LocalServiceMessage(
-        zone.id,
-        LocalAction.DoorOpens(Service.defaultPlayerGUID, zone, door)
-      )
-    }
-    else {
-      //the door should already open, but the requesting player does not see it as open
-      sender() ! LocalServiceResponse(
-        player.Name,
-        Service.defaultPlayerGUID,
-        LocalResponse.DoorOpens(doorGUID)
-      )
+  /**
+   * If the player is close enough to the door,
+   * the locking mechanism allows for the door to open,
+   * and the door is not bolted shut (locked),
+   * then tell the door that it should open.
+   * @param player player who is standing somewhere
+   * @param door door that is installed somewhere
+   * @param maximumDistance permissible square distance between the player and the door
+   * @param replyTo the player's session message reference
+   */
+  private def testToOpenDoor(
+                              player: Player,
+                              door: Door,
+                              maximumDistance: Float,
+                              replyTo: ActorRef
+                            ): Unit = {
+    if (
+        Doors.testForSpecificTargetHoldingDoorOpen(player, door, maximumDistance * maximumDistance).contains(player) &&
+          lockingMechanism(player, door)
+    ) {
+      DoorControl.openDoor(player, door, replyTo)
     }
   }
 
@@ -89,5 +94,34 @@ class DoorControl(door: Door)
 }
 
 object DoorControl {
+  //noinspection ScalaUnusedSymbol
   def alwaysOpen(obj: PlanetSideServerObject, door: Door): Boolean = true
+
+  /**
+   * If the door is not open, open this door, propped open by the given player.
+   * If the door is considered open, ensure the door is proper visible as open to the player.
+   * @param player the player
+   * @param door the door
+   * @param replyTo the player's session message reference
+   */
+  private def openDoor(player: Player, door: Door, replyTo: ActorRef = Default.Actor): Unit = {
+    val zone = door.Zone
+    if (!door.isOpen) {
+      //global open
+      door.Open = player
+      zone.LocalEvents ! DoorMessage(
+        zone.id,
+        LocalAction.DoorOpens(zone, door),
+        DoorCloseActor.DoorIsOpen(door, zone, System.currentTimeMillis())
+      )
+    } else {
+      //the door should already open, but the requesting player does not see it as open
+      replyTo ! GenericResponseEnvelope(
+        LocalStamp,
+        player.Name,
+        Default.GUID0,
+        LocalAction.DoorOpens(door.Zone, door)
+      )
+    }
+  }
 }

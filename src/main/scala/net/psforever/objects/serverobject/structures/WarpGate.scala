@@ -3,15 +3,13 @@ package net.psforever.objects.serverobject.structures
 
 import akka.actor.ActorContext
 import net.psforever.objects.serverobject.PlanetSideServerObject
-import net.psforever.objects.{GlobalDefinitions, NtuContainer, SpawnPoint}
+import net.psforever.objects.{NtuContainer, SpawnPoint}
 import net.psforever.objects.zones.Zone
-import net.psforever.packet.game.BuildingInfoUpdateMessage
-import net.psforever.types.{PlanetSideEmpire, PlanetSideGeneratorState, Vector3}
+import net.psforever.types._
 import akka.actor.typed.scaladsl.adapter._
 import net.psforever.actors.zone.BuildingActor
-import net.psforever.objects.definition.ObjectDefinition
-
-import scala.collection.mutable
+import net.psforever.actors.zone.building.BuildingLogic
+import net.psforever.packet.game.packets.BuildingInfoUpdateMessage
 
 class WarpGate(name: String, building_guid: Int, map_id: Int, zone: Zone, buildingDefinition: WarpGateDefinition)
     extends Building(name, building_guid, map_id, zone, StructureType.WarpGate, buildingDefinition)
@@ -21,31 +19,31 @@ class WarpGate(name: String, building_guid: Int, map_id: Int, zone: Zone, buildi
   private var active: Boolean = true
 
   /** what faction views this warp gate as a broadcast gate */
-  private var broadcast: mutable.Set[PlanetSideEmpire.Value] = mutable.Set.empty[PlanetSideEmpire.Value]
+  private var passageFor: Set[PlanetSideEmpire.Value] = Set(PlanetSideEmpire.NEUTRAL)
 
   override def infoUpdateMessage(): BuildingInfoUpdateMessage = {
     BuildingInfoUpdateMessage(
       Zone.Number,
       MapId,
       0,
-      false,
+      is_hacked = false,
       PlanetSideEmpire.NEUTRAL,
       0L,
-      Faction,
-      0, //!! Field != 0 will cause malformed packet. See class def.
+      Faction, //should be neutral in most cases
+      0, //Field != 0 will cause malformed packet. See class def.
       None,
       PlanetSideGeneratorState.Normal,
-      true,  //TODO?
-      false, //force_dome_active
-      0,     //lattice_benefit
-      0,     //cavern_benefit; !! Field > 0 will cause malformed packet. See class def.
+      spawn_tubes_normal = true,
+      force_dome_active = false,
+      Set(LatticeBenefit.None),
+      Set(CavernBenefit.None), //Field > 0 will cause malformed packet. See class def.
       Nil,
       0,
-      false,
+      unk6 = false,
       8, //!! Field != 8 will cause malformed packet. See class def.
       None,
-      false, //boost_spawn_pain
-      false  //boost_generator_pain
+      boost_spawn_pain = false,
+      boost_generator_pain = false
     )
   }
 
@@ -72,54 +70,34 @@ class WarpGate(name: String, building_guid: Int, map_id: Int, zone: Zone, buildi
   /**
     * Determine whether any faction interacts with this warp gate as "broadcast."
     * The gate must be active first.
+    * A broadcast gate allows specific factions only.
     * @return `true`, if some faction sees this warp gate as a "broadcast gate";
     *        `false`, otherwise
     */
-  def Broadcast: Boolean = Active && broadcast.nonEmpty
+  def Broadcast: Boolean = Active && !passageFor.contains(PlanetSideEmpire.NEUTRAL)
 
   /**
     * Determine whether a specific faction interacts with this warp gate as "broadcast."
-    * The warp gate being `NEUTRAL` should allow for any polled faction to interact.
-    * The gate must be active first.
     * @return `true`, if the given faction interacts with this warp gate as a "broadcast gate";
     *        `false`, otherwise
     */
   def Broadcast(faction: PlanetSideEmpire.Value): Boolean = {
-    Active && (broadcast.contains(faction) || broadcast.contains(PlanetSideEmpire.NEUTRAL))
+    Broadcast && passageFor.contains(faction)
   }
 
   /**
-    * Toggle whether the warp gate's faction-affiliated force interacts with this warp gate as "broadcast."
-    * Other "broadcast" associations are not affected.
-    * The gate must be active first.
-    * @param bcast `true`, if the faction-affiliated force interacts with this gate as broadcast;
-    *             `false`, if not
+    * Which factions interact with this warp gate as "broadcast"?
     * @return the set of all factions who interact with this warp gate as "broadcast"
     */
-  def Broadcast_=(bcast: Boolean): Set[PlanetSideEmpire.Value] = {
-    if (Active) {
-      if (bcast) {
-        broadcast += Faction
-      } else {
-        broadcast -= Faction
-      }
-    }
-    broadcast.toSet
-  }
-
-  /**
-    * Which factions interact with this warp gate as "broadcast?"
-    * @return the set of all factions who interact with this warp gate as "broadcast"
-    */
-  def BroadcastFor: Set[PlanetSideEmpire.Value] = broadcast.toSet
+  def AllowBroadcastFor: Set[PlanetSideEmpire.Value] = passageFor
 
   /**
     * Allow a faction to interact with a given warp gate as "broadcast" if it is active.
     * @param bcast the faction
     * @return the set of all factions who interact with this warp gate as "broadcast"
     */
-  def BroadcastFor_=(bcast: PlanetSideEmpire.Value): Set[PlanetSideEmpire.Value] = {
-    (broadcast += bcast).toSet
+  def AllowBroadcastFor_=(bcast: PlanetSideEmpire.Value): Set[PlanetSideEmpire.Value] = {
+    AllowBroadcastFor_=(Set(bcast))
   }
 
   /**
@@ -127,26 +105,14 @@ class WarpGate(name: String, building_guid: Int, map_id: Int, zone: Zone, buildi
     * @param bcast the factions
     * @return the set of all factions who interact with this warp gate as "broadcast"
     */
-  def BroadcastFor_=(bcast: Set[PlanetSideEmpire.Value]): Set[PlanetSideEmpire.Value] = {
-    (broadcast ++= bcast).toSet
-  }
-
-  /**
-    * Disallow a faction to interact with a given warp gate as "broadcast."
-    * @param bcast the faction
-    * @return the set of all factions who interact with this warp gate as "broadcast"
-    */
-  def StopBroadcastFor_=(bcast: PlanetSideEmpire.Value): Set[PlanetSideEmpire.Value] = {
-    (broadcast -= bcast).toSet
-  }
-
-  /**
-    * Disallow some factions to interact with a given warp gate as "broadcast."
-    * @param bcast the factions
-    * @return the set of all factions who interact with this warp gate as "broadcast"
-    */
-  def StopBroadcastFor_=(bcast: Set[PlanetSideEmpire.Value]): Set[PlanetSideEmpire.Value] = {
-    (broadcast --= bcast).toSet
+  def AllowBroadcastFor_=(bcast: Set[PlanetSideEmpire.Value]): Set[PlanetSideEmpire.Value] = {
+    val validFactions = bcast.filterNot(_ == PlanetSideEmpire.NEUTRAL)
+    passageFor = if (bcast.isEmpty || validFactions.isEmpty) {
+      Set(PlanetSideEmpire.NEUTRAL)
+    } else {
+      validFactions
+    }
+    AllowBroadcastFor
   }
 
   def Owner: PlanetSideServerObject = this
@@ -157,11 +123,13 @@ class WarpGate(name: String, building_guid: Int, map_id: Int, zone: Zone, buildi
 
   def MaxNtuCapacitor : Float = Int.MaxValue
 
+  override def isOffline: Boolean = !Active
+
   override def NtuSource: Option[NtuContainer] = Some(this)
 
-  override def hasLatticeBenefit(wantedBenefit: ObjectDefinition): Boolean = false
+  override def hasLatticeBenefit(wantedBenefit: LatticeBenefit): Boolean = false
 
-  override def latticeConnectedFacilityBenefits(): Set[ObjectDefinition] = Set.empty
+  override def latticeConnectedFacilityBenefits(): Set[LatticeBenefit] = Set.empty[LatticeBenefit]
 
   override def Definition: WarpGateDefinition = buildingDefinition
 }
@@ -171,28 +139,14 @@ object WarpGate {
     new WarpGate(name, guid, map_id, zone, buildingDefinition)
   }
 
-  def Structure(name: String, guid: Int, map_id: Int, zone: Zone, context: ActorContext): WarpGate = {
-    val obj = new WarpGate(name, guid, map_id, zone, GlobalDefinitions.warpgate)
-    obj.Actor = context.spawn(BuildingActor(zone, obj), name = s"$map_id-$guid-gate").toClassic
-    obj
-  }
-
   def Structure(
-      location: Vector3
-  )(name: String, guid: Int, map_id: Int, zone: Zone, context: ActorContext): WarpGate = {
-    val obj = new WarpGate(name, guid, map_id, zone, GlobalDefinitions.warpgate)
-    obj.Position = location
-    obj.Actor = context.spawn(BuildingActor(zone, obj), name = s"$map_id-$guid-gate").toClassic
-    obj
-  }
-
-  def Structure(
-      location: Vector3,
-      buildingDefinition: WarpGateDefinition
-  )(name: String, guid: Int, map_id: Int, zone: Zone, context: ActorContext): WarpGate = {
+                 location: Vector3,
+                 buildingDefinition: WarpGateDefinition,
+                 logic: BuildingLogic
+               )(name: String, guid: Int, map_id: Int, zone: Zone, context: ActorContext): WarpGate = {
     val obj = new WarpGate(name, guid, map_id, zone, buildingDefinition)
     obj.Position = location
-    obj.Actor = context.spawn(BuildingActor(zone, obj), name = s"$map_id-$guid-gate").toClassic
+    obj.Actor = context.spawn(BuildingActor(zone, obj, logic), name = s"$map_id-$guid-gate").toClassic
     obj
   }
 }

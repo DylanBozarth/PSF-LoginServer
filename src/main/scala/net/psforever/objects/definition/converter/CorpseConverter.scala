@@ -1,14 +1,14 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects.definition.converter
 
-import net.psforever.objects.Player
+import net.psforever.objects.{Default, Player}
 import net.psforever.objects.avatar.Certification
 import net.psforever.packet.game.objectcreate._
-import net.psforever.types.{PlanetSideGUID, _}
+import net.psforever.types._
 
 import scala.util.{Failure, Success, Try}
 
-class CorpseConverter extends AvatarConverter {
+object CorpseConverter extends ObjectCreateConverter[Player] {
   override def ConstructorData(obj: Player): Try[PlayerData] =
     Failure(new Exception("CorpseConverter should not be used to generate CharacterData"))
 
@@ -30,18 +30,8 @@ class CorpseConverter extends AvatarConverter {
     */
   private def MakeAppearanceData(obj: Player): Int => CharacterAppearanceData = {
     val aa: Int => CharacterAppearanceA = CharacterAppearanceA(
-      BasicCharacterData(obj.Name, obj.Faction, CharacterSex.Male, 0, CharacterVoice.Mute),
-      CommonFieldData(
-        obj.Faction,
-        bops = false,
-        alternate = true,
-        v1 = false,
-        None,
-        jammered = false,
-        None,
-        v5 = None,
-        PlanetSideGUID(0)
-      ),
+      obj.avatar.basic,
+      CommonFieldData(obj.Faction, bops = false, alternate = true, v1 = false, None, jammered = false, v5 = None, Default.GUID0),
       obj.ExoSuit,
       0,
       0L,
@@ -70,7 +60,7 @@ class CorpseConverter extends AvatarConverter {
       unk7 = false,
       on_zipline = None
     )
-    CharacterAppearanceData(aa, ab, RibbonBars())
+    CharacterAppearanceData(aa, ab, obj.avatar.decoration.ribbonBars)
   }
 
   private def MakeDetailedCharacterData(obj: Player): Option[Int] => DetailedCharacterData = {
@@ -116,8 +106,4 @@ class CorpseConverter extends AvatarConverter {
     )
     pad_length: Option[Int] => DetailedCharacterData(ba, bb(0, pad_length))(pad_length)
   }
-}
-
-object CorpseConverter {
-  val converter = new CorpseConverter
 }

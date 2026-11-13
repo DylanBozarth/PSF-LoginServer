@@ -4,9 +4,10 @@ package net.psforever.services.chat
 import akka.actor.typed.receptionist.{Receptionist, ServiceKey}
 import akka.actor.typed.{ActorRef, Behavior}
 import akka.actor.typed.scaladsl.{AbstractBehavior, ActorContext, Behaviors}
-import net.psforever.objects.Session
-import net.psforever.packet.game.ChatMsg
-import net.psforever.types.{ChatMessageType, PlanetSideEmpire, PlanetSideGUID}
+import net.psforever.objects.{Session, SessionSource}
+import net.psforever.packet.game.packets.ChatMsg
+import net.psforever.services.base.message.{EventMessage, EventResponse}
+import net.psforever.types.{ChatMessageType, PlanetSideEmpire}
 
 object ChatService {
   val ChatServiceKey: ServiceKey[Command] = ServiceKey[ChatService.Command]("chatService")
@@ -17,22 +18,16 @@ object ChatService {
       new ChatService(context)
     }
 
-  sealed trait Command
+  sealed trait Command extends EventMessage {
+    def response(): EventResponse = null
+  }
 
-  final case class JoinChannel(actor: ActorRef[MessageResponse], session: Session, channel: ChatChannel) extends Command
+  final case class JoinChannel(actor: ActorRef[MessageResponse], sessionSource: SessionSource, channel: ChatChannel) extends Command
   final case class LeaveChannel(actor: ActorRef[MessageResponse], channel: ChatChannel)                  extends Command
   final case class LeaveAllChannels(actor: ActorRef[MessageResponse])                                    extends Command
 
   final case class Message(session: Session, message: ChatMsg, channel: ChatChannel) extends Command
-  final case class MessageResponse(session: Session, message: ChatMsg, channel: ChatChannel)
-
-  trait ChatChannel
-  object ChatChannel {
-    // one of the default channels that the player is always subscribed to (local, broadcast, command...)
-    final case class Default()                   extends ChatChannel
-    final case class Squad(guid: PlanetSideGUID) extends ChatChannel
-  }
-
+  final case class MessageResponse(session: Session, message: ChatMsg, channel: ChatChannel) extends EventResponse
 }
 
 class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBehavior[ChatService.Command](context) {
@@ -63,34 +58,51 @@ class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBe
 
       case Message(session, message, channel) =>
         (channel, message.messageType) match {
-          case (ChatChannel.Squad(_), CMT_SQUAD)                                      => ()
-          case (ChatChannel.Squad(_), CMT_VOICE) if message.contents.startsWith("SH") => ()
-          case (ChatChannel.Default(), messageType) if messageType != CMT_SQUAD       => ()
+          case (SquadChannel(_), CMT_SQUAD)                                      => ()
+          case (SquadChannel(_), CMT_VOICE) if message.contents.startsWith("SH") => ()
+          case (OutfitChannel(_), CMT_OUTFIT)                                    => ()
+          case (DefaultChannel, messageType) if messageType != CMT_SQUAD && messageType != CMT_OUTFIT => ()
+          case (SpectatorChannel, messageType) if messageType != CMT_SQUAD && messageType != CMT_OUTFIT => ()
           case _ =>
             log.error(s"invalid chat channel $channel for messageType ${message.messageType}")
             return this
         }
         val subs = subscriptions.filter(_.channel == channel)
         message.messageType match {
-          case CMT_TELL | CMT_GMTELL =>
-            subs.find(_.session.player.Name == session.player.Name).foreach {
-              case JoinChannel(sender, _, _) =>
+          case mtype @ (CMT_TELL | CMT_GMTELL) =>
+            val playerName = session.player.Name
+            val playerNameLower = playerName.toLowerCase()
+            val recipientName = message.recipient
+            val recipientNameLower = recipientName.toLowerCase()
+            (
+              subs.find(_.sessionSource.session.player.Name.toLowerCase().equals(playerNameLower)),
+              subs.find(_.sessionSource.session.player.Name.toLowerCase().equals(recipientNameLower))
+            ) match {
+              case (Some(JoinChannel(sender, _, _)), Some(JoinChannel(receiver, _, _))) =>
+                val replyType = if (mtype == CMT_TELL) { U_CMT_TELLFROM } else { U_CMT_GMTELLFROM }
                 sender ! MessageResponse(
                   session,
-                  message.copy(messageType = if (message.messageType == CMT_TELL) U_CMT_TELLFROM else U_CMT_GMTELLFROM),
+                  message.copy(messageType = replyType),
                   channel
                 )
-                subs.find(_.session.player.Name.toLowerCase() == message.recipient.toLowerCase()) match {
-                  case Some(JoinChannel(receiver, _, _)) =>
-                    receiver ! MessageResponse(session, message.copy(recipient = session.player.Name), channel)
-                  case None =>
-                    sender ! MessageResponse(
-                      session,
-                      ChatMsg(ChatMessageType.UNK_45, wideContents = false, "", "@NoTell_Target", None),
-                      channel
-                    )
-                }
-
+                receiver ! MessageResponse(session, message.copy(recipient = playerName), channel)
+              case (None, Some(JoinChannel(receiver, _, _))) =>
+                log.warn(s"ChatMsg->$mtype: can not find subscription object for: sender=$playerName")
+                receiver ! MessageResponse(session, message.copy(recipient = playerName), channel)
+              case (Some(JoinChannel(sender, _, _)), None) =>
+                val replyType = if (mtype == CMT_TELL) { U_CMT_TELLFROM } else { U_CMT_GMTELLFROM }
+                sender ! MessageResponse(
+                  session,
+                  message.copy(messageType = replyType),
+                  channel
+                )
+                sender ! MessageResponse(
+                  session,
+                  ChatMsg(ChatMessageType.UNK_45, wideContents = false, "", "@NoTell_Target", None),
+                  channel
+                )
+              case (None, None) =>
+                log.error(s"ChatMsg->$mtype: can not find subscription object for: sender=$playerName")
             }
 
           case CMT_SILENCE =>
@@ -107,23 +119,23 @@ class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBe
               case _ => (None, None, None)
             }
 
-            val sender = subs.find(_.session.player.Name == session.player.Name)
+            val sender = subs.find(_.sessionSource.session.player.Name == session.player.Name)
 
             (sender, name, time, error) match {
               case (Some(sender), Some(name), Some(_), None) =>
-                val recipient = subs.find(_.session.player.Name == name)
+                val recipient = subs.find(_.sessionSource.session.player.Name == name)
                 recipient match {
                   case Some(recipient) =>
-                    if (recipient.session.player.silenced) {
+                    if (recipient.sessionSource.session.player.silenced) {
                       sender.actor ! MessageResponse(
                         session,
-                        ChatMsg(UNK_229, true, "", "@silence_disabled_ack", None),
+                        ChatMsg(UNK_229, wideContents = true, "", "@silence_disabled_ack", None),
                         channel
                       )
                     } else {
                       sender.actor ! MessageResponse(
                         session,
-                        ChatMsg(UNK_229, true, "", "@silence_enabled_ack", None),
+                        ChatMsg(UNK_229, wideContents = true, "", "@silence_enabled_ack", None),
                         channel
                       )
                     }
@@ -131,14 +143,14 @@ class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBe
                   case None =>
                     sender.actor ! MessageResponse(
                       session,
-                      ChatMsg(UNK_229, true, "", s"unknown player '$name'", None),
+                      ChatMsg(UNK_229, wideContents = true, "", s"unknown player '$name'", None),
                       channel
                     )
                 }
               case (Some(sender), _, _, error) =>
                 sender.actor ! MessageResponse(
                   session,
-                  ChatMsg(UNK_229, false, "", error.getOrElse("usage: /silence <name> [<time>]"), None),
+                  ChatMsg(UNK_229, wideContents = false, "", error.getOrElse("usage: /silence <name> [<time>]"), None),
                   channel
                 )
 
@@ -150,9 +162,12 @@ class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBe
           case CMT_SQUAD =>
             subs.foreach(_.actor ! MessageResponse(session, message, channel))
 
+          case CMT_OUTFIT =>
+            subs.foreach(_.actor ! MessageResponse(session, message, channel))
+
           case CMT_NOTE =>
             subs
-              .filter(_.session.player.Name == message.recipient)
+              .filter(_.sessionSource.session.player.Name == message.recipient)
               .foreach(
                 _.actor ! MessageResponse(session, message.copy(recipient = session.player.Name), channel)
               )
@@ -160,23 +175,23 @@ class ChatService(context: ActorContext[ChatService.Command]) extends AbstractBe
           // faction commands
           case CMT_OPEN | CMT_PLATOON | CMT_COMMAND =>
             subs
-              .filter(_.session.player.Faction == session.player.Faction)
+              .filter(_.sessionSource.session.player.Faction == session.player.Faction)
               .foreach(
                 _.actor ! MessageResponse(session, message, channel)
               )
 
           case CMT_GMBROADCAST_NC =>
-            subs.filter(_.session.player.Faction == PlanetSideEmpire.NC).foreach {
+            subs.filter(_.sessionSource.session.player.Faction == PlanetSideEmpire.NC).foreach {
               case JoinChannel(actor, _, _) => actor ! MessageResponse(session, message, channel)
             }
 
           case CMT_GMBROADCAST_TR =>
-            subs.filter(_.session.player.Faction == PlanetSideEmpire.TR).foreach {
+            subs.filter(_.sessionSource.session.player.Faction == PlanetSideEmpire.TR).foreach {
               case JoinChannel(actor, _, _) => actor ! MessageResponse(session, message, channel)
             }
 
           case CMT_GMBROADCAST_VS =>
-            subs.filter(_.session.player.Faction == PlanetSideEmpire.VS).foreach {
+            subs.filter(_.sessionSource.session.player.Faction == PlanetSideEmpire.VS).foreach {
               case JoinChannel(actor, _, _) => actor ! MessageResponse(session, message, channel)
             }
 

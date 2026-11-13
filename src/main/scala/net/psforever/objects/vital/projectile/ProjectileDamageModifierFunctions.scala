@@ -1,8 +1,10 @@
 // Copyright (c) 2020 PSForever
 package net.psforever.objects.vital.projectile
 
+import net.psforever.objects.GlobalDefinitions
 import net.psforever.objects.ballistics._
 import net.psforever.objects.equipment.ChargeFireModeDefinition
+import net.psforever.objects.sourcing.{PlayerSource, VehicleSource}
 import net.psforever.objects.vital.base._
 import net.psforever.objects.vital.damage.DamageModifierFunctions
 import net.psforever.objects.vital.interaction.DamageInteraction
@@ -253,7 +255,9 @@ case object SpikerChargeDamage extends ProjectileDamageModifiers.Mod {
     (projectile.fire_mode, projectile.profile.Charging) match {
       case (_: ChargeFireModeDefinition, Some(info: ChargeDamage)) =>
         val chargeQuality = math.max(0f, math.min(projectile.quality.mod, 1f))
-        cause.damageModel.DamageUsing(info.min) + (damage * chargeQuality).toInt
+        val min = cause.damageModel.DamageUsing(info.min)
+        val range = if (damage > min) { damage - min } else { min - damage }
+        min + (range * chargeQuality).toInt
       case _ =>
         damage
     }
@@ -329,24 +333,15 @@ case object FlailDistanceDamageBoost extends ProjectileDamageModifiers.Mod {
   }
 }
 
-/**
-  * If the damge is caused by a projectile that emits a field that permeates armor,
-  * determine by how much the traversed armor's shielding reduces the damage.
-  * Infantry take damage, reduced only if one is equipped with a mechanized assault exo-suit.
-  */
-case object ShieldAgainstRadiation extends ProjectileDamageModifiers.Mod {
+/** The Cerberus turret can not target any entities besides flying vehicles.
+  * An exception to this rule, however, happens when retaliating against something that damaged it first. */
+case object CerberusTurretWrongTarget extends ProjectileDamageModifiers.Mod {
   def calculate(damage: Int, data: DamageInteraction, cause: ProjectileReason): Int = {
-    if (data.resolution == DamageResolution.Radiation) {
-      data.target match {
-        case p: PlayerSource if p.ExoSuit == ExoSuitType.MAX =>
-          damage - (damage * p.Modifiers.RadiationShielding).toInt
-        case _: PlayerSource =>
-          damage
-        case _ =>
-          0
-      }
-    } else {
-      damage
+    data.target match {
+      case v: VehicleSource if GlobalDefinitions.isFlightVehicle(v.Definition) =>
+        damage
+      case _ =>
+        damage - (math.random() * 3d).toInt - 1
     }
   }
 }
@@ -459,7 +454,7 @@ object ProjectileDamageModifierFunctions {
             case _ =>
               1f
           }
-          if (p.exosuit == ExoSuitType.MAX) {
+          if (p.ExoSuit == ExoSuitType.MAX) {
             (damage * degradation * aggravation.max_factor) toInt
           } else {
             val resist = cause.damageModel.ResistUsing(data)(data)

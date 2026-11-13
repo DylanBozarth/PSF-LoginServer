@@ -4,20 +4,29 @@ package net.psforever.objects
 import net.psforever.objects.avatar.Certification
 import net.psforever.login.WorldSession.FindEquipmentStock
 import net.psforever.objects.avatar.PlayerControl
+import net.psforever.objects.avatar.scoring.Kill
 import net.psforever.objects.ce.Deployable
 import net.psforever.objects.definition.ExoSuitDefinition
 import net.psforever.objects.equipment.EquipmentSlot
 import net.psforever.objects.guid.{GUIDTask, TaskWorkflow}
 import net.psforever.objects.inventory.InventoryItem
 import net.psforever.objects.loadouts.InfantryLoadout
+import net.psforever.objects.serverobject.affinity.FactionAffinity
+import net.psforever.objects.sourcing.PlayerSource
+import net.psforever.objects.vehicles.MountedWeapons
+import net.psforever.objects.vital.projectile.ProjectileReason
+import net.psforever.objects.vital.{InGameActivity, InGameHistory, RevivingActivity}
 import net.psforever.objects.zones.Zone
-import net.psforever.packet.game._
-import net.psforever.types.{ChatMessageType, ExoSuitType, Vector3}
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
-import net.psforever.services.local.{LocalAction, LocalServiceMessage}
+import net.psforever.packet.game.packets._
+import net.psforever.packet.game.packets.{ChangeAmmoMessage, GenericObjectActionMessage, ObjectDeployedMessage, RepairMessage}
+import net.psforever.types.{ChatMessageType, ExoSuitType, PlanetSideGUID, Vector3}
+import net.psforever.services.avatar.AvatarAction
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.base.message.{ObjectDelete, SendResponse}
+import net.psforever.services.local.LocalAction
 
 import scala.annotation.tailrec
+import scala.collection.mutable.ArrayBuffer
 
 object Players {
   private val log = org.log4s.getLogger("Players")
@@ -42,10 +51,7 @@ object Players {
     ) {
       val events = target.Zone.AvatarEvents
       val uname  = user.Name
-      events ! AvatarServiceMessage(
-        uname,
-        AvatarAction.SendResponse(Service.defaultPlayerGUID, RepairMessage(target.GUID, progress.toInt))
-      )
+      events ! MessageEnvelope(uname, SendResponse(RepairMessage(target.GUID, progress.toInt)))
       true
     } else {
       false
@@ -55,23 +61,27 @@ object Players {
   /**
     * na
     * @see `AvatarAction.Revive`
-    * @see `AvatarResponse.Revive`
+    * @see `AvatarAction.Revive`
     * @param target the player being revived
     * @param medic the name of the player doing the reviving
     * @param item the tool being used to revive the target player
     */
-  def FinishRevivingPlayer(target: Player, medic: String, item: Tool)(): Unit = {
+  def FinishRevivingPlayer(target: Player, medic: Player, item: Tool)(): Unit = {
     val name = target.Name
-    log.info(s"$medic had revived $name")
+    val medicName = medic.Name
+    log.info(s"$medicName had revived $name")
+    //give credit even if the player does not revive
+    target.LogActivity(RevivingActivity(PlayerSource(target), PlayerSource(medic), target.MaxHealth, item.Definition))
     val magazine = item.Discharge(Some(25))
-    target.Zone.AvatarEvents ! AvatarServiceMessage(
-      medic,
-      AvatarAction.SendResponse(
-        Service.defaultPlayerGUID,
+    PlayerControl.sendResponse(
+      target.Zone,
+      medicName,
+      Default.GUID0,
+      SendResponse(
         InventoryStateMessage(item.AmmoSlot.Box.GUID, item.GUID, magazine)
       )
     )
-    target.Zone.AvatarEvents ! AvatarServiceMessage(name, AvatarAction.Revive(target.GUID))
+    PlayerControl.sendResponse(target.Zone, name, Default.GUID0, AvatarAction.Revive(target.GUID))
   }
 
   /**
@@ -106,25 +116,34 @@ object Players {
     * For any slots that are not yet occupied by an item, search through the `List` and find an item that fits in that slot.
     * Add that item to the slot and remove it from the list.
     * @param iter the `Iterator` of `EquipmentSlot`s
-    * @param list a `List` of all `Equipment` that is not yet assigned to a holster slot or an inventory slot
-    * @return the `List` of all `Equipment` not yet assigned to a holster slot or an inventory slot
+    * @param list a list of all `Equipment` not assigned to a new slot
+    * @param slotNum current slot index associated with the value extracted from `iter` param
+    * @param placedList a list of all `Equipment` reassigned to a slot
+    * @return two lists:
+   *         all `Equipment` reassigned to a slot, and
+   *         all `Equipment` not assigned to a new slot
     */
-  @tailrec def fillEmptyHolsters(iter: Iterator[EquipmentSlot], list: List[InventoryItem]): List[InventoryItem] = {
+  @tailrec def fillEmptyHolsters(
+                                  iter: Iterator[EquipmentSlot],
+                                  list: List[InventoryItem],
+                                  slotNum: Int = 0,
+                                  placedList: List[InventoryItem] = Nil
+                                ): (List[InventoryItem], List[InventoryItem]) = {
     if (!iter.hasNext) {
-      list
+      (placedList, list)
     } else {
       val slot = iter.next()
       if (slot.Equipment.isEmpty) {
-        list.find(item => item.obj.Size == slot.Size) match {
-          case Some(obj) =>
-            val index = list.indexOf(obj)
-            slot.Equipment = obj.obj
-            fillEmptyHolsters(iter, list.take(index) ++ list.drop(index + 1))
-          case None =>
-            fillEmptyHolsters(iter, list)
+        list.indexWhere(item => item.obj.Size == slot.Size) match {
+          case -1 =>
+            fillEmptyHolsters(iter, list, slotNum + 1, placedList)
+          case index =>
+            val entry = list(index)
+            entry.start = slotNum
+            fillEmptyHolsters(iter, list.take(index) ++ list.drop(index + 1), slotNum + 1, placedList :+ entry)
         }
       } else {
-        fillEmptyHolsters(iter, list)
+        fillEmptyHolsters(iter, list, slotNum + 1, placedList)
       }
     }
   }
@@ -143,6 +162,8 @@ object Players {
   def CertificationToUseExoSuit(player: Player, exosuit: ExoSuitType.Value, subtype: Int): Boolean = {
     ExoSuitDefinition.Select(exosuit, player.Faction).Permissions match {
       case Nil =>
+        true
+      case _ if player.Zone.isVR =>
         true
       case permissions if subtype != 0 =>
         val certs = player.avatar.certifications
@@ -243,7 +264,7 @@ object Players {
             PlayerControl.sendResponse(
               zone,
               channel,
-              ChatMsg(ChatMessageType.UNK_229, false, "", s"@${definition.Descriptor}OldestDestroyed", None)
+              ChatMsg(ChatMessageType.UNK_229, s"@${definition.Descriptor}OldestDestroyed")
             )
           }
           true
@@ -265,7 +286,7 @@ object Players {
         PlayerControl.sendResponse(
           zone,
           channel,
-          ChatMsg(ChatMessageType.UNK_229, false, "", s"@${definition.Descriptor}LimitReached", None)
+          ChatMsg(ChatMessageType.UNK_229, s"@${definition.Descriptor}LimitReached")
         )
       }
       true
@@ -295,7 +316,7 @@ object Players {
                              ): Boolean = {
     if (player.Zone == obj.Zone && addFunc(obj)) {
       obj.Actor ! Deployable.Ownership(player)
-      player.Zone.LocalEvents ! LocalServiceMessage(player.Name, LocalAction.DeployableUIFor(obj.Definition.Item))
+      player.Zone.LocalEvents ! MessageEnvelope(player.Name, LocalAction.DeployableUIFor(obj.Definition.Item))
       true
     } else {
       false
@@ -310,9 +331,9 @@ object Players {
     */
   def successfulBuildActivity(zone: Zone, channel: String, obj: Deployable): Unit = {
     //sent to avatar event bus to preempt additional tool management
-    buildCooldownReset(zone, channel, obj)
+    buildCooldownReset(zone, channel, obj.GUID)
     //sent to local event bus to cooperate with deployable management
-    zone.LocalEvents ! LocalServiceMessage(
+    zone.LocalEvents ! MessageEnvelope(
       channel,
       LocalAction.DeployableUIFor(obj.Definition.Item)
     )
@@ -322,14 +343,11 @@ object Players {
     * Common actions related to constructing a new `Deployable` object in the game environment.
     * @param zone in which zone these messages apply
     * @param channel to whom to send the messages
-    * @param obj the `Deployable` object
+    * @param guid `Deployable` object
     */
-  def buildCooldownReset(zone: Zone, channel: String, obj: Deployable): Unit = {
+  def buildCooldownReset(zone: Zone, channel: String, guid: PlanetSideGUID): Unit = {
     //sent to avatar event bus to preempt additional tool management
-    zone.AvatarEvents ! AvatarServiceMessage(
-      channel,
-      AvatarAction.SendResponse(Service.defaultPlayerGUID, GenericObjectActionMessage(obj.GUID, 21))
-    )
+    zone.AvatarEvents ! MessageEnvelope(channel, SendResponse(GenericObjectActionMessage(guid, 21)))
   }
 
   /**
@@ -385,10 +403,7 @@ object Players {
       }
     }) {
       val zone = player.Zone
-      zone.AvatarEvents ! AvatarServiceMessage(
-        zone.id,
-        AvatarAction.ObjectDelete(Service.defaultPlayerGUID, tool.GUID, 0)
-      )
+      zone.AvatarEvents ! MessageEnvelope(zone.id, ObjectDelete(tool.GUID))
       true
     } else {
       false
@@ -423,31 +438,20 @@ object Players {
           if ((player.Slot(index).Equipment = obj).contains(obj)) {
             val fireMode = tool.FireModeIndex
             val ammoType = tool.AmmoTypeIndex
+            val list: ArrayBuffer[MessageEnvelope] = ArrayBuffer()
             player.Inventory -= x.start
             obj.FireModeIndex = fireMode
             //TODO any penalty for being handed an OCM version of the tool?
-            events ! AvatarServiceMessage(
-              zone.id,
-              AvatarAction.EquipmentInHand(Service.defaultPlayerGUID, pguid, index, obj)
-            )
+            list.append(MessageEnvelope(zone.id, AvatarAction.EquipmentInHand(pguid, index, obj)))
             if (obj.AmmoTypeIndex != ammoType) {
               obj.AmmoTypeIndex = ammoType
-              events ! AvatarServiceMessage(
-                name,
-                AvatarAction.SendResponse(Service.defaultPlayerGUID, ChangeAmmoMessage(obj.GUID, ammoType))
-              )
+              list.append(MessageEnvelope(name, SendResponse(ChangeAmmoMessage(obj.GUID, ammoType))))
             }
             if (player.DrawnSlot == Player.HandsDownSlot) {
               player.DrawnSlot = index
-              events ! AvatarServiceMessage(
-                name,
-                AvatarAction.SendResponse(Service.defaultPlayerGUID, ObjectHeldMessage(pguid, index, true))
-              )
-              events ! AvatarServiceMessage(
-                zone.id,
-                AvatarAction.ObjectHeld(pguid, index)
-              )
+              list.append(MessageEnvelope(zone.id, pguid, AvatarAction.ObjectHeld(index, index)))
             }
+            events ! BundledEnvelope(list)
           }
         case Nil => ; //no replacements found
       }
@@ -455,6 +459,55 @@ object Players {
       log.warn(
         s"FindReplacementConstructionItem: ${player.Name}, your $index hand needs to be empty before a replacement ${definition.Name} can be installed"
       )
+    }
+  }
+
+  /**
+   * na
+   * @param zone where the event occurred
+   * @param player person attributed to the event
+   * @param killStat information about the event
+   * @return player-specific historical information and then related information that is inherited from other entities
+   */
+  def produceContributionTranscriptFromKill(zone: Zone, player: Player, killStat: Kill): List[InGameActivity] = {
+    (killStat.info.interaction.cause match {
+      case pr: ProjectileReason => pr.projectile.mounted_in.flatMap { a => zone.GUID(a._1) } //what fired the projectile
+      case _ => None
+    }).collect {
+      case mount: PlanetSideGameObject with FactionAffinity with InGameHistory with MountedWeapons =>
+        player.ContributionFrom(mount)
+    }
+    player.HistoryAndContributions()
+  }
+
+  /**
+   * Select the player's zone channel.
+   * If the player is spectating, then that is their channel instead.
+   * The resulting channel name should never be used for subscribing - only for publishing.
+   * @param player player in a zone
+   * @return channel name
+   */
+  def ZoneChannelIfSpectating(player: Player): String = {
+    if (player.spectator) {
+      "spectator"
+    } else {
+      player.Zone.id
+    }
+  }
+
+  /**
+   * Select the player's zone channel.
+   * If the player is spectating, then that is their channel instead.
+   * The resulting channel name should never be used for subscribing - only for publishing.
+   * @param player player in a zone
+   * @param zoneid custom zone name to be used as the channel name
+   * @return channel name
+   */
+  def ZoneChannelIfSpectating(player: Player, zoneid: String): String = {
+    if (player.spectator) {
+      "spectator"
+    } else {
+      zoneid
     }
   }
 }

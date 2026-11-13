@@ -2,18 +2,21 @@
 package net.psforever.objects.vital.resolution
 
 import net.psforever.objects._
-import net.psforever.objects.ballistics.{PlayerSource, SourceEntry}
+import net.psforever.objects.avatar.AvatarBot
 import net.psforever.objects.ce.Deployable
 import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.damage.Damageable
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
 import net.psforever.objects.vehicles.VehicleSubsystemEntry
 import net.psforever.objects.vital.base.DamageResolution
-import net.psforever.objects.vital.{DamagingActivity, Vitality, VitalsHistory}
+import net.psforever.objects.vital.{DamagingActivity, InGameHistory, Vitality}
 import net.psforever.objects.vital.damage.DamageCalculations
 import net.psforever.objects.vital.interaction.{DamageInteraction, DamageResult}
 import net.psforever.objects.vital.projectile.ProjectileReason
 import net.psforever.objects.vital.resistance.ResistanceSelection
 import net.psforever.types.{ExoSuitType, ImplantType}
+
+import scala.annotation.unused
 
 /**
   * The base for the combining step of all projectile-induced damage calculation function literals.
@@ -37,13 +40,16 @@ object ResolutionCalculations {
   type Output = PlanetSideGameObject with FactionAffinity => DamageResult
   type Form   = (DamageCalculations.Selector, ResistanceSelection.Format, DamageInteraction) => Output
 
-  def NoDamage(data: DamageInteraction)(a: Int, b: Int): Int = 0
+
+  def NoDamage(@unused data: DamageInteraction)(@unused a: Int, @unused b: Int): Int = 0
 
   def InfantryDamage(data: DamageInteraction): (Int, Int) => (Int, Int) = {
     data.target match {
       case target: PlayerSource =>
-        if(data.cause.source.DamageToHealthOnly) {
+        if (data.cause.source.DamageToHealthOnly) {
           DamageToHealthOnly(target.health)
+        } else if (data.cause.source.DamageToArmorFirst) {
+          InfantryArmorDamageFirst(target.health, target.armor)
         } else {
           InfantryDamageAfterResist(target.health, target.armor)
         }
@@ -75,6 +81,25 @@ object ResolutionCalculations {
           (resistedDam, resistance) //armor and health damage
         } else {
           (resistedDam + (resistance - currentArmor), currentArmor) //deplete armor; health damage + bonus
+        }
+      } else {
+        (0, damages) //too weak; armor damage (less than resistance)
+      }
+    } else {
+      (0, 0) //no damage
+    }
+  }
+
+  def InfantryArmorDamageFirst(currentHP: Int, currentArmor: Int)(damages: Int, resistance: Int): (Int, Int) = {
+    if (damages > 0 && currentHP > 0) {
+      if (currentArmor <= 0) {
+        (damages, 0) //no armor; health damage
+      } else if (damages > resistance) {
+        val resistedDam = damages - resistance
+        if (resistedDam <= currentArmor) {
+          (0, resistedDam) //armor damage
+        } else {
+          (resistedDam, currentArmor) //deplete armor; health damage
         }
       } else {
         (0, damages) //too weak; armor damage (less than resistance)
@@ -131,7 +156,7 @@ object ResolutionCalculations {
     }
   }
 
-  def NoApplication(damageValue: Int, data: DamageInteraction)(target: PlanetSideGameObject with FactionAffinity): DamageResult = {
+  def NoApplication(@unused damageValue: Int, data: DamageInteraction)(target: PlanetSideGameObject with FactionAffinity): DamageResult = {
     val sameTarget = SourceEntry(target)
     DamageResult(sameTarget, sameTarget, data)
   }
@@ -210,6 +235,50 @@ object ResolutionCalculations {
             val delta = originalHealth - player.Health
             player.avatar =
               player.avatar.copy(stamina = math.max(0, player.avatar.stamina - math.floor(delta / 2).toInt))
+          }
+        }
+      case bot: AvatarBot if noDoubleLash(bot, data) =>
+        var (a, b) = damageValues
+        if (bot.isAlive && !(a == 0 && b == 0)) {
+          val originalHealth = bot.Health
+          if (data.cause.source.DamageToHealthOnly) {
+            bot.Health = SubtractWithRemainder(bot.Health, a)._1
+          } else {
+            var result = (0, 0)
+            bot.implants.flatten.find(x => x.definition.implantType == ImplantType.PersonalShield) match {
+              case Some(implant) if implant.active =>
+                // Subtract armour damage from stamina
+                result = SubtractWithRemainder(bot.stamina, b)
+                bot.stamina = result._1
+                b = result._2
+
+                // Then follow up with health damage if any stamina is left
+                result = SubtractWithRemainder(bot.stamina, a)
+                bot.stamina = result._1
+                a = result._2
+
+              case _ => ;
+            }
+
+            // Subtract any remaining armour damage from armour
+            result = SubtractWithRemainder(bot.Armor, b)
+            bot.Armor = result._1
+            b = result._2
+            // Then bleed through to health if armour ran out
+            result = SubtractWithRemainder(bot.Health, b)
+            bot.Health = result._1
+            b = result._2
+
+            // Finally, apply health damage to health
+            result = SubtractWithRemainder(bot.Health, a)
+            bot.Health = result._1
+            //if b > 0 (armor) or result._2 > 0 (health), then we did the math wrong
+          }
+
+          // If any health damage was applied also drain an amount of stamina equal to half the health damage
+          if (bot.Health < originalHealth) {
+            val delta = originalHealth - bot.Health
+            bot.stamina = math.max(0, bot.stamina - math.floor(delta / 2).toInt)
           }
         }
       case _ =>
@@ -312,7 +381,7 @@ object ResolutionCalculations {
 
   def WildcardApplication(damage: Any, data: DamageInteraction)(target: PlanetSideGameObject with FactionAffinity): DamageResult = {
     target match {
-      case _: Player =>
+      case _: Player | _: AvatarBot  =>
         val dam : (Int, Int) = damage match {
           case (a: Int, b: Int) => (a, b)
           case a: Int => (a, 0)
@@ -354,7 +423,7 @@ object ResolutionCalculations {
           {
             data.cause.source.DamageToBattleframeOnly ||
             data.cause.source.DamageToVehicleOnly ||
-            !obj.Subsystems(VehicleSubsystemEntry.BattleframeShieldGenerator).get.Enabled ||
+            !obj.Subsystems(VehicleSubsystemEntry.BattleframeShieldGenerator).exists(_.Enabled) ||
             obj.Shields == 0
           }
         )
@@ -368,7 +437,7 @@ object ResolutionCalculations {
     }
   }
 
-  private def noDoubleLash(target: PlanetSideGameObject with VitalsHistory, data: DamageInteraction): Boolean = {
+  private def noDoubleLash(target: PlanetSideGameObject with InGameHistory, data: DamageInteraction): Boolean = {
     data.cause match {
       case reason: ProjectileReason if reason.resolution == DamageResolution.Lash =>
         val curr = System.currentTimeMillis()

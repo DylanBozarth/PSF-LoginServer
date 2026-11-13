@@ -2,6 +2,7 @@
 package net.psforever.packet.game.objectcreate
 
 import net.psforever.packet.Marshallable
+import net.psforever.types.VehicleFormat
 import scodec.{Attempt, Codec, Err}
 import shapeless.HNil
 import scodec.codecs._
@@ -61,7 +62,7 @@ object BattleFrameRoboticsData extends Marshallable[BattleFrameRoboticsData] {
     import shapeless.::
     (
       ("pos" | PlacementData.codec) >>:~ { pos =>
-        ("data" | CommonFieldData.codec(extra = false)) ::
+        ("data" | CommonFieldData.codec) ::
         ("health" | uint8L) ::
         ("shield" | uint8L) ::
         ("unk1" | uint16) :: //usually 0
@@ -71,7 +72,7 @@ object BattleFrameRoboticsData extends Marshallable[BattleFrameRoboticsData] {
         ("proper_anim" | bool) :: //when unflagged, bfr stands, even if unmanned
         ("unk3" | uint4) ::
         ("show_bfr_shield" | bool) ::
-        optional(bool, target = "inventory" | MountableInventory.custom_inventory_codec(pos.vel.isDefined, VehicleFormat.Battleframe))
+        ("inventory" | optional(bool, MountableInventory.custom_inventory_codec(pos.vel.isDefined, VehicleFormat.Battleframe)))
       }
       ).exmap[BattleFrameRoboticsData] (
       {
@@ -95,7 +96,7 @@ object BattleFrameRoboticsData extends Marshallable[BattleFrameRoboticsData] {
     import shapeless.::
     (
       ("pos" | PlacementData.codec) >>:~ { pos =>
-        ("data" | CommonFieldData.codec(extra = false)) ::
+        ("data" | CommonFieldData.codec) ::
         ("health" | uint8L) ::
         ("shield" | uint8L) ::
         ("unk1" | uint16) :: //usually 0
@@ -106,7 +107,7 @@ object BattleFrameRoboticsData extends Marshallable[BattleFrameRoboticsData] {
         ("unk3" | uint4) ::
         ("show_bfr_shield" | bool) ::
         ("unk4" | bool) ::
-        optional(bool, target = "inventory" | MountableInventory.custom_inventory_codec(pos.vel.isDefined, VehicleFormat.BattleframeFlight))
+        ("inventory" | optional(bool, MountableInventory.custom_inventory_codec(pos.vel.isDefined, VehicleFormat.BattleframeFlight)))
       }
       ).exmap[BattleFrameRoboticsData] (
       {

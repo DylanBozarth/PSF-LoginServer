@@ -1,7 +1,7 @@
 // Copyright (c) 2020 PSForever
 package net.psforever.objects.vital.etc
 
-import net.psforever.objects.ballistics.SourceEntry
+import net.psforever.objects.sourcing.SourceEntry
 import net.psforever.objects.vital.{NoResistanceSelection, SimpleResolutions}
 import net.psforever.objects.vital.base.{DamageReason, DamageResolution}
 import net.psforever.objects.vital.damage.DamageCalculations
@@ -29,7 +29,7 @@ final case class SuicideReason()
   eventually, they stop logging in.
 
   Anyway, this has nothing to do with that.
-  Most playes probably just want to jump to the next base over.
+  Most players probably just want to jump to the next base over.
   */
   def source: DamageProperties = SuicideReason.damageProperties
 

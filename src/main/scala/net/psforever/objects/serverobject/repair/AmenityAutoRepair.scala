@@ -9,6 +9,7 @@ import net.psforever.actors.zone.BuildingActor
 import net.psforever.objects.{Default, NtuContainer, NtuStorageBehavior}
 import net.psforever.objects.serverobject.damage.Damageable
 import net.psforever.objects.serverobject.structures.{Amenity, AutoRepairStats, Building}
+import net.psforever.objects.vital.RepairFromAmenityAutoRepair
 import net.psforever.util.Config
 
 import scala.concurrent.duration._
@@ -87,7 +88,7 @@ trait AmenityAutoRepair
         val wholeRepairAmount = modifiedRepairAmount.toInt
         val overflowRepairAmount = modifiedRepairAmount - wholeRepairAmount
         val finalRepairAmount = if (autoRepairOverflow + overflowRepairAmount < 1) {
-          autoRepairOverflow += overflowRepairAmount
+          autoRepairOverflow = autoRepairOverflow + overflowRepairAmount
           wholeRepairAmount
         } else {
           val totalOverflow = autoRepairOverflow + overflowRepairAmount
@@ -96,6 +97,7 @@ trait AmenityAutoRepair
           wholeRepairAmount + wholeOverflow
         }
         PerformRepairs(obj, finalRepairAmount)
+        obj.LogActivity(RepairFromAmenityAutoRepair(finalRepairAmount))
         val currentTime = System.currentTimeMillis()
         val taskTime = currentTime - autoRepairQueueTask.getOrElse(currentTime)
         autoRepairQueueTask = Some(0L)
@@ -148,7 +150,8 @@ trait AmenityAutoRepair
     * or if the current process has stalled.
     */
   private def startAutoRepairIfStopped(): Unit = {
-    if(autoRepairQueueTask.isEmpty || stallDetection(stallTime = 15000L)) {
+    val stallTime: Long = 15000L
+    if(autoRepairQueueTask.isEmpty || stallDetection(stallTime)) {
       trySetupAutoRepairInitial()
     }
   }
@@ -266,21 +269,20 @@ trait AmenityAutoRepair
     import scala.concurrent.ExecutionContext.Implicits.global
     autoRepairTimer.cancel()
     autoRepairQueueTask = Some(System.currentTimeMillis() + delay)
-    val modifiedDrain = drain * 2 * Config.app.game.amenityAutorepairDrainRate //doubled intentionally
-    autoRepairTimer = if(AutoRepairObject.Owner == Building.NoBuilding) {
-      //without an owner, auto-repair freely
-      context.system.scheduler.scheduleOnce(
-        delay milliseconds,
-        self,
-        NtuCommand.Grant(null, modifiedDrain)
-      )
-    } else {
-      //ask politely
-      context.system.scheduler.scheduleOnce(
-        delay milliseconds,
-        AutoRepairObject.Owner.Actor,
-        BuildingActor.Ntu(NtuCommand.Request(modifiedDrain, ntuGrantActorRef))
-      )
-    }
+    val modifiedDrain = drain * Config.app.game.amenityAutorepairDrainRate //doubled intentionally
+    AutoRepairObject.Owner match {
+      case Building.NoBuilding =>
+        autoRepairTimer = context.system.scheduler.scheduleOnce(
+          delay.milliseconds,
+          self,
+          NtuCommand.Grant(null, modifiedDrain))
+      case b: Building =>
+        val doubledDrain = if (b.virusId == 2) modifiedDrain * 2 else modifiedDrain
+        autoRepairTimer = context.system.scheduler.scheduleOnce(
+          delay.milliseconds,
+          b.Actor,
+          BuildingActor.Ntu(NtuCommand.Request(doubledDrain, ntuGrantActorRef)))
+      case _ => ()
+      }
   }
 }

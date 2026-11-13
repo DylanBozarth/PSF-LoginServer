@@ -1,10 +1,11 @@
 // Copyright (c) 2020 PSForever
 package objects
 
+import akka.actor.testkit.typed.scaladsl.ActorTestKit
 import akka.actor.{ActorRef, Props}
 import akka.testkit.TestProbe
 import base.ActorTest
-import net.psforever.actors.zone.BuildingActor
+import net.psforever.actors.zone.{BuildingActor, ZoneActor}
 import net.psforever.objects.avatar.{Avatar, Certification}
 import net.psforever.objects.ballistics._
 import net.psforever.objects.{GlobalDefinitions, Player, Tool}
@@ -13,16 +14,19 @@ import net.psforever.objects.guid.source.MaxNumberSource
 import net.psforever.objects.serverobject.CommonMessages
 import net.psforever.objects.serverobject.generator.{Generator, GeneratorControl, GeneratorDefinition}
 import net.psforever.objects.serverobject.structures.{Building, StructureType}
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
 import net.psforever.objects.vital.Vitality
 import net.psforever.objects.vital.base.DamageResolution
 import net.psforever.objects.vital.interaction.DamageInteraction
 import net.psforever.objects.vital.projectile.ProjectileReason
 import net.psforever.objects.vital.prop.DamageWithPosition
 import net.psforever.objects.zones.{Zone, ZoneMap}
-import net.psforever.packet.game.{InventoryStateMessage, RepairMessage, TriggerEffectMessage}
+import net.psforever.packet.game.packets.{InventoryStateMessage, RepairMessage, TriggerEffectMessage}
 import net.psforever.types._
 import org.specs2.mutable.Specification
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.services.avatar.AvatarAction
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.{PlanetsideAttribute, SendResponse}
 
 import scala.concurrent.duration._
 
@@ -116,7 +120,7 @@ class GeneratorControlDamageTest extends ActorTest {
       val msg_building = buildingProbe.receiveOne(500 milliseconds)
       assert(
         msg_avatar match {
-          case AvatarServiceMessage("test", AvatarAction.PlanetsideAttributeToAll(PlanetSideGUID(2), 0, _)) => true
+          case MessageEnvelope("test", _, PlanetsideAttribute(PlanetSideGUID(2), 0, _)) => true
           case _                                                                                            => false
         }
       )
@@ -201,7 +205,7 @@ class GeneratorControlCriticalTest extends ActorTest {
       val msg_building = buildingProbe.receiveOne(500 milliseconds)
       assert(
         msg_avatar match {
-          case AvatarServiceMessage("test", AvatarAction.PlanetsideAttributeToAll(PlanetSideGUID(2), 0, _)) => true
+          case MessageEnvelope("test", _, PlanetsideAttribute(PlanetSideGUID(2), 0, _)) => true
           case _                                                                                            => false
         }
       )
@@ -310,21 +314,22 @@ class GeneratorControlDestroyedTest extends ActorTest {
       )
       assert(
         msg_avatar2.head match {
-          case AvatarServiceMessage("test", AvatarAction.PlanetsideAttributeToAll(PlanetSideGUID(2), 0, _)) => true
+          case MessageEnvelope("test", _, PlanetsideAttribute(PlanetSideGUID(2), 0, _)) => true
           case _                                                                                            => false
         }
       )
       assert(
         msg_avatar2(1) match {
-          case AvatarServiceMessage("test", AvatarAction.Destroy(PlanetSideGUID(2), _, _, Vector3(1, 0, 0))) => true
+          case MessageEnvelope("test", _, AvatarAction.Destroy(PlanetSideGUID(2), _, _, Vector3(1, 0, 0))) => true
           case _                                                                                             => false
         }
       )
       assert(
         msg_avatar2(2) match {
-          case AvatarServiceMessage(
+          case MessageEnvelope(
                 "test",
-                AvatarAction.SendResponse(_, TriggerEffectMessage(PlanetSideGUID(2), "explosion_generator", None, None))
+                _,
+                SendResponse(Seq(TriggerEffectMessage(PlanetSideGUID(2), "explosion_generator", None, None)))
               ) =>
             true
           case _ => false
@@ -359,6 +364,7 @@ class GeneratorControlKillsTest extends ActorTest {
   val activityProbe = TestProbe()
   val guid = new NumberPoolHub(new MaxNumberSource(5))
   val zone = new Zone("test", new ZoneMap("test"), 0) {
+    actor = ActorTestKit().createTestProbe[ZoneActor.Command]().ref
     override def SetupNumberPools() = {}
     GUID(guid)
     override def LivePlayers = List(player1, player2)
@@ -437,21 +443,22 @@ class GeneratorControlKillsTest extends ActorTest {
       )
       assert(
         msg_avatar2.head match {
-          case AvatarServiceMessage("test", AvatarAction.PlanetsideAttributeToAll(PlanetSideGUID(2), 0, _)) => true
+          case MessageEnvelope("test", _, PlanetsideAttribute(PlanetSideGUID(2), 0, _)) => true
           case _                                                                                            => false
         }
       )
       assert(
         msg_avatar2(1) match {
-          case AvatarServiceMessage("test", AvatarAction.Destroy(PlanetSideGUID(2), _, _, Vector3(1, 0, 0))) => true
+          case MessageEnvelope("test", _, AvatarAction.Destroy(PlanetSideGUID(2), _, _, Vector3(1, 0, 0))) => true
           case _                                                                                             => false
         }
       )
       assert(
         msg_avatar2(2) match {
-          case AvatarServiceMessage(
+          case MessageEnvelope(
           "test",
-          AvatarAction.SendResponse(_, TriggerEffectMessage(PlanetSideGUID(2), "explosion_generator", None, None))
+          _,
+          SendResponse(Seq(TriggerEffectMessage(PlanetSideGUID(2), "explosion_generator", None, None)))
           ) =>
             true
           case _ => false
@@ -815,10 +822,10 @@ class GeneratorControlRepairPastRestorePoint extends ActorTest {
       val msg_building = buildingProbe.receiveOne(200 milliseconds)
       assert(
         msg_avatar.head match {
-          case AvatarServiceMessage(
+          case MessageEnvelope(
                 "TestCharacter1",
-                AvatarAction
-                  .SendResponse(_, InventoryStateMessage(ValidPlanetSideGUID(5), _, ValidPlanetSideGUID(4), _))
+                _,
+                SendResponse(Seq(InventoryStateMessage(ValidPlanetSideGUID(5), _, ValidPlanetSideGUID(4), _)))
               ) =>
             true
           case _ => false
@@ -826,15 +833,16 @@ class GeneratorControlRepairPastRestorePoint extends ActorTest {
       )
       assert(
         msg_avatar(1) match {
-          case AvatarServiceMessage("test", AvatarAction.PlanetsideAttributeToAll(PlanetSideGUID(2), 0, _)) => true
+          case MessageEnvelope("test", _, PlanetsideAttribute(PlanetSideGUID(2), 0, _)) => true
           case _                                                                                            => false
         }
       )
       assert(
         msg_avatar(2) match {
-          case AvatarServiceMessage(
+          case MessageEnvelope(
                 "TestCharacter1",
-                AvatarAction.SendResponse(_, RepairMessage(ValidPlanetSideGUID(2), _))
+                _,
+                SendResponse(Seq(RepairMessage(ValidPlanetSideGUID(2), _)))
               ) =>
             true
           case _ => false

@@ -2,29 +2,30 @@
 package game
 
 import net.psforever.packet._
-import net.psforever.packet.game._
+import net.psforever.packet.game.packets._
+import net.psforever.packet.game.packets.SquadMembershipResponse
 import net.psforever.types.SquadResponseType
 import org.specs2.mutable._
 import scodec.bits._
 
 class SquadMembershipResponseTest extends Specification {
-  val string_01 = hex"6f0 00854518050db2260108048006f006600440000"
-  val string_02 = hex"6f0 0049e8220112aa1e01100530050004f0049004c0045005200530080"
-  val string_11 = hex"6f1 995364f2040000000100080"
-  val string_12 = hex"6f1 90cadcf4040000000100080"
-  val string_21 = hex"6f2 010db2260085451805140560069007200750073004700690076006500720080"
-  val string_22 = hex"6f2 010db22601da03aa03140560069007200750073004700690076006500720080"
-  val string_31 = hex"6f3 07631db202854518050a048004d0046004900430000"
-  val string_32 = hex"6f3 04c34fb402854518050e0440041004e00310031003100310000"
-  val string_41 = hex"6f4 04cadcf405bbbef405140530041007200610069007300560061006e00750000"
-  val string_42 = hex"6f4 05c9c0f405d71aec0516041006900720049006e006a006500630074006f00720000"
-  val string_51 = hex"6f5 0249e8220049e822010e0430043005200490044004500520080"
-  val string_71 = hex"6f7 1049e822000000000100080"
-  val string_72 = hex"6f7 00cadcf4041355ae03100570069007a006b00690064003400350080"
-  val string_81 = hex"6f8 001355ae02cadcf405100570069007a006b00690064003400350000"
-  val string_91 = hex"6f9 008310080115aef40500080"
-  val string_92 = hex"6f9 001355ae02cadcf405100570069007a006b00690064003400350000"
-  val string_b1 = hex"6fb 021355ae02cadcf405140530041007200610069007300560061006e00750000"
+  val string_01 = hex"6f 0 00854518050db2260108048006f006600440000"
+  val string_02 = hex"6f 0 0049e8220112aa1e01100530050004f0049004c0045005200530080"
+  val string_11 = hex"6f 1 995364f2040000000100080"
+  val string_12 = hex"6f 1 90cadcf4040000000100080"
+  val string_21 = hex"6f 2 010db2260085451805140560069007200750073004700690076006500720080"
+  val string_22 = hex"6f 2 010db22601da03aa03140560069007200750073004700690076006500720080"
+  val string_31 = hex"6f 3 07631db202854518050a048004d0046004900430000"
+  val string_32 = hex"6f 3 04c34fb402854518050e0440041004e00310031003100310000"
+  val string_41 = hex"6f 4 04cadcf405bbbef405140530041007200610069007300560061006e00750000"
+  val string_42 = hex"6f 4 05c9c0f405d71aec0516041006900720049006e006a006500630074006f00720000"
+  val string_51 = hex"6f 5 0249e8220049e822010e0430043005200490044004500520080"
+  val string_71 = hex"6f 7 1049e822000000000100080"
+  val string_72 = hex"6f 7 00cadcf4041355ae03100570069007a006b00690064003400350080"
+  val string_81 = hex"6f 8 001355ae02cadcf405100570069007a006b00690064003400350000"
+  val string_91 = hex"6f 9 008310080115aef40500080"
+  val string_92 = hex"6f 9 001355ae02cadcf405100570069007a006b00690064003400350000"
+  val string_b1 = hex"6f b 021355ae02cadcf405140530041007200610069007300560061006e00750000"
 
   "SquadMembershipResponse" should {
     "decode (0-1)" in {
@@ -62,7 +63,7 @@ class SquadMembershipResponseTest extends Specification {
     "decode (1-1)" in {
       PacketCoding.decodePacket(string_11).require match {
         case SquadMembershipResponse(unk1, unk2, unk3, unk4, unk5, unk6, unk7, unk8) =>
-          unk1 mustEqual SquadResponseType.Unk01
+          unk1 mustEqual SquadResponseType.ProximityInvite
           unk2 mustEqual 19
           unk3 mustEqual 0
           unk4 mustEqual 41530025L
@@ -78,7 +79,7 @@ class SquadMembershipResponseTest extends Specification {
     "decode (1-2)" in {
       PacketCoding.decodePacket(string_12).require match {
         case SquadMembershipResponse(unk1, unk2, unk3, unk4, unk5, unk6, unk7, unk8) =>
-          unk1 mustEqual SquadResponseType.Unk01
+          unk1 mustEqual SquadResponseType.ProximityInvite
           unk2 mustEqual 18
           unk3 mustEqual 0
           unk4 mustEqual 41578085L
@@ -315,14 +316,14 @@ class SquadMembershipResponseTest extends Specification {
     }
 
     "encode (1-1)" in {
-      val msg = SquadMembershipResponse(SquadResponseType.Unk01, 19, 0, 41530025L, Some(0L), "", true, Some(None))
+      val msg = SquadMembershipResponse(SquadResponseType.ProximityInvite, 19, 0, 41530025L, Some(0L), "", true, Some(None))
       val pkt = PacketCoding.encodePacket(msg).require.toByteVector
 
       pkt mustEqual string_11
     }
 
     "encode (1-2)" in {
-      val msg = SquadMembershipResponse(SquadResponseType.Unk01, 18, 0, 41578085L, Some(0L), "", true, Some(None))
+      val msg = SquadMembershipResponse(SquadResponseType.ProximityInvite, 18, 0, 41578085L, Some(0L), "", true, Some(None))
       val pkt = PacketCoding.encodePacket(msg).require.toByteVector
 
       pkt mustEqual string_12

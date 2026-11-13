@@ -1,36 +1,28 @@
 package net.psforever.objects.serverobject.terminals.capture
 
 import akka.actor.Actor.Receive
-import net.psforever.objects.serverobject.mount.Mountable
 import net.psforever.objects.serverobject.structures.Amenity
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+
+import scala.annotation.unused
 
 /**
   * The behaviours corresponding to an Amenity that is marked as being CaptureTerminalAware
   * @see CaptureTerminalAware
   */
 trait CaptureTerminalAwareBehavior {
-  def CaptureTerminalAwareObject : Amenity with CaptureTerminalAware
+  def CaptureTerminalAwareObject: Amenity with CaptureTerminalAware
 
   val captureTerminalAwareBehaviour: Receive = {
-    case CaptureTerminalAwareBehavior.TerminalStatusChanged(terminal, isResecured) =>
-      isResecured match {
-        case true => ; // CC is resecured
-        case false => // CC is hacked
-          // Remove seated occupants for mountables
-          if (CaptureTerminalAwareObject.isInstanceOf[Mountable]) {
-            CaptureTerminalAwareObject.asInstanceOf[Mountable].Seats.filter(x => x._2.isOccupied).foreach(x => {
-              val (seat_num, seat) = x
-              val user = seat.occupant.get
-              CaptureTerminalAwareObject.Zone.VehicleEvents ! VehicleServiceMessage(
-                CaptureTerminalAwareObject.Zone.id,
-                VehicleAction.KickPassenger(user.GUID, seat_num, true, CaptureTerminalAwareObject.GUID)
-              )
-              seat.unmount(user)
-            })
-          }
-      }
+    case CaptureTerminalAwareBehavior.TerminalStatusChanged(terminal, true) =>
+      captureTerminalIsResecured(terminal)
+
+    case CaptureTerminalAwareBehavior.TerminalStatusChanged(terminal, _) =>
+      captureTerminalIsHacked(terminal)
   }
+
+  protected def captureTerminalIsResecured(@unused terminal: CaptureTerminal): Unit = { /* intentionally blank */ }
+
+  protected def captureTerminalIsHacked(@unused terminal: CaptureTerminal): Unit = { /* intentionally blank */ }
 }
 
 object CaptureTerminalAwareBehavior {

@@ -9,34 +9,35 @@ import shapeless.{::, HNil}
 object RemoteProjectiles {
   abstract class Data(val a: Int, val b: Int)
 
-  final case object Meteor                          extends Data(0, 32)
-  final case object Wasp                            extends Data(0, 208)
-  final case object Sparrow                         extends Data(13107, 187)
-  final case object OICW                            extends Data(13107, 195)
-  final case object Striker                         extends Data(26214, 134)
-  final case object HunterSeeker                    extends Data(39577, 201)
-  final case object Starfire                        extends Data(39577, 249)
-
-  //the oicw_little_buddy is handled by its own transcoder
+  final case object LilBuddy         extends Data(0, 0)
+  final case object Meteor           extends Data(0, 32)
+  final case object Wasp             extends Data(0, 208)
+  final case object Sparrow          extends Data(13107, 187)
+  final case object PeregrineSparrow extends Data(13107, 187)
+  final case object OICW             extends Data(13107, 195)
+  final case object Striker          extends Data(26214, 134)
+  final case object HunterSeeker     extends Data(39577, 201)
+  final case object Starfire         extends Data(39577, 249)
+  final case object AphelionStarfire extends Data(39577, 249)
 }
 
 object FlightPhysics extends Enumeration {
   type Type = Value
 
   //valid (extremely small distance) (requires non-zero unk4, unk5)
-  val State3 = Value(3)
+  val State3: FlightPhysics.Value = Value(3)
   //valid (infinite) (if unk4 == 0 unk5 == 0, minimum distance + time)
-  val State4 = Value(4)
+  val State4: FlightPhysics.Value = Value(4)
   //valid(infinite)
-  val State5 = Value(5)
+  val State5: FlightPhysics.Value = Value(5)
   //valid (uses velocity) (infinite)
-  val State6 = Value(6)
+  val State6: FlightPhysics.Value = Value(6)
   //valid (uses velocity) (infinite)
-  val State7 = Value(7)
+  val State7: FlightPhysics.Value = Value(7)
   //valid (uses velocity) (time > 0 is infinite) (unk5 == 2)
-  val State15 = Value(15)
+  val State15: FlightPhysics.Value = Value(15)
 
-  implicit val codec = PacketHelpers.createEnumerationCodec(this, uint4L)
+  implicit val codec: Codec[FlightPhysics.Value] = PacketHelpers.createEnumerationCodec(this, uint4)
 }
 
 /**
@@ -46,19 +47,19 @@ object FlightPhysics extends Enumeration {
   *           first part of the canned remote projectile data
   * @param u2 na;
   *           second part of the canned remote projectile data
-  * @param unk3 na;
-  *             does something to how the projectile flies
+  * @param u3 na;
+  *           does something to how the projectile flies
   * @param unk4 na
   * @param unk5 na
   */
 final case class RemoteProjectileData(
-    common_data: CommonFieldDataWithPlacement,
-    u1: Int,
-    u2: Int,
-    unk3: FlightPhysics.Value,
-    unk4: Int,
-    unk5: Int
-) extends ConstructorData {
+                                       common_data: CommonFieldDataWithPlacement,
+                                       u1: Int,
+                                       u2: Int,
+                                       u3: FlightPhysics.Value,
+                                       unk4: Int,
+                                       unk5: Int
+                                     ) extends ConstructorData {
   override def bitsize: Long = 33L + common_data.bitsize
 }
 
@@ -67,7 +68,7 @@ object RemoteProjectileData extends Marshallable[RemoteProjectileData] {
     ("data" | CommonFieldDataWithPlacement.codec) ::
       ("u1" | uint16) ::
       ("u2" | uint8) ::
-      ("unk3" | FlightPhysics.codec) ::
+      ("u3" | FlightPhysics.codec) ::
       ("unk4" | uint(bits = 3)) ::
       ("unk5" | uint2)
   ).exmap[RemoteProjectileData](

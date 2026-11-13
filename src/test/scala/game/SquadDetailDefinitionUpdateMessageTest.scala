@@ -3,7 +3,8 @@ package game
 
 import net.psforever.objects.avatar.Certification
 import net.psforever.packet._
-import net.psforever.packet.game._
+import net.psforever.packet.game.packets._
+import net.psforever.packet.game.packets.{PlanetSideZoneID, SquadDetail, SquadDetailDefinitionUpdateMessage, SquadPositionDetail, SquadPositionEntry}
 import net.psforever.types.PlanetSideGUID
 import org.specs2.mutable._
 import scodec.bits._
@@ -294,7 +295,7 @@ class SquadDetailDefinitionUpdateMessageTest extends Specification {
                   Some(member_list)
                 ) =>
               u1 mustEqual 3
-              u2 mustEqual 1792
+              u2 mustEqual 7
               char_id mustEqual 42771010L
               u3 mustEqual 529745L
               leader mustEqual "HofD"
@@ -651,7 +652,7 @@ class SquadDetailDefinitionUpdateMessageTest extends Specification {
       val msg = SquadDetailDefinitionUpdateMessage(
         PlanetSideGUID(3),
         SquadDetail()
-          .Field1(0)
+          .Guid(0)
           .LeaderCharId(1221560L)
           .Members(
             List(
@@ -677,7 +678,7 @@ class SquadDetailDefinitionUpdateMessageTest extends Specification {
         PlanetSideGUID(3),
         SquadDetail()
           .Leader(42631712L, "Jaako")
-          .Field3(556403L)
+          .OutfitId(556403L)
           .Members(
             List(
               SquadPositionEntry(0, SquadPositionDetail().Player(0L, ""))
@@ -832,7 +833,7 @@ class SquadDetailDefinitionUpdateMessageTest extends Specification {
         PlanetSideGUID(3),
         SquadDetail(
           3,
-          1792,
+          7,
           42771010L,
           529745L,
           "HofD",

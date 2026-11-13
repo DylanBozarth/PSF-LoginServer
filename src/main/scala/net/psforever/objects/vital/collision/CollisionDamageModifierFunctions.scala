@@ -1,8 +1,8 @@
 // Copyright (c) 2021 PSForever
 package net.psforever.objects.vital.collision
 
-import net.psforever.objects.ballistics.{DeployableSource, PlayerSource, VehicleSource}
 import net.psforever.objects.definition.ExoSuitDefinition
+import net.psforever.objects.sourcing.{DeployableSource, PlayerSource, VehicleSource}
 import net.psforever.objects.vital.interaction.DamageInteraction
 import net.psforever.types.Vector3
 
@@ -11,7 +11,7 @@ import net.psforever.types.Vector3
   */
 case object GroundImpact extends CollisionDamageModifiers.Mod {
   def calculate(damage: Int, data: DamageInteraction, cause: CollisionReason): Int =
-    CollisionDamageModifierFunctions.calculateGroundImpact(damage, data, cause)
+    CollisionDamageModifierFunctions.calculateGroundImpact(damage, data, cause) / 3
 }
 
 /**
@@ -19,7 +19,7 @@ case object GroundImpact extends CollisionDamageModifiers.Mod {
   */
 case object GroundImpactWith extends CollisionWithDamageModifiers.Mod {
   def calculate(damage: Int, data: DamageInteraction, cause: CollisionWithReason): Int =
-    CollisionDamageModifierFunctions.calculateGroundImpact(damage, data, cause)
+    CollisionDamageModifierFunctions.calculateGroundImpact(damage, data, cause) / 3
 }
 
 /**
@@ -33,9 +33,9 @@ case object HeadonImpact extends CollisionDamageModifiers.Mod {
     if (vel > 0.05f) {
       val definition = data.target.Definition
       val xy = definition.collision.xy
-      damage + xy.hp(xy.throttle((vel + 0.5f) / definition.maxForwardSpeed))
+      (damage + xy.hp(xy.throttle((vel + 0.5f) / definition.maxForwardSpeed))) / 2
     } else {
-      damage
+      damage / 2
     }
   }
 }

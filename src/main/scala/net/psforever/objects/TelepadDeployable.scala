@@ -11,7 +11,8 @@ import net.psforever.objects.vehicles.Utility.InternalTelepad
 import net.psforever.objects.vital.SimpleResolutions
 import net.psforever.objects.vital.interaction.DamageResult
 import net.psforever.objects.zones.Zone
-import net.psforever.services.local.{LocalAction, LocalServiceMessage}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.local.LocalAction
 
 import scala.concurrent.duration._
 
@@ -103,8 +104,7 @@ class TelepadDeployableControl(tpad: TelepadDeployable)
   override def startOwnerlessDecay(): Unit = {
     //telepads do not decay when they become ownerless
     //telepad decay is tied to their lifecycle with routers
-    tpad.Owner = None
-    tpad.OwnerName = None
+    tpad.AssignOwnership(None)
   }
 
   override def finalizeDeployable(callback: ActorRef): Unit = {
@@ -134,6 +134,6 @@ object TelepadControl {
   }
 
   def TelepadError(zone: Zone, channel: String, msg: String): Unit = {
-    zone.LocalEvents ! LocalServiceMessage(channel, LocalAction.RouterTelepadMessage(msg))
+    zone.LocalEvents ! MessageEnvelope(channel, LocalAction.RouterTelepadMessage(msg))
   }
 }

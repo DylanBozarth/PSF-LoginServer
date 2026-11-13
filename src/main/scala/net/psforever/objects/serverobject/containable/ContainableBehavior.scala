@@ -2,7 +2,7 @@
 package net.psforever.objects.serverobject.containable
 
 import akka.actor.{Actor, ActorRef}
-import akka.pattern.{AskTimeoutException, ask}
+import akka.pattern.ask
 import akka.util.Timeout
 import net.psforever.objects.equipment.{Equipment, EquipmentSize}
 import net.psforever.objects.inventory.{Container, InventoryItem}
@@ -42,6 +42,7 @@ trait ContainableBehavior {
     * The destination is set back to normal - flag to `0` - when both of the attempts short-circuit due to timeout.
     */
   private var waitOnMoveItemOps: Int = 0
+  private var itemSwapSlot: Int = 10 // Just a number higher than any inventory item slots
 
   final val containerBehavior: Receive = {
     /* messages that modify delivery order */
@@ -136,6 +137,15 @@ trait ContainableBehavior {
   }
 
   /* Functions (item transfer) */
+  // For issue 1108
+  def UpdateItemSwapSlot: Int = {
+    itemSwapSlot = 10
+    itemSwapSlot
+  }
+  // For issue 1108
+  def ItemSwapSlot: Int = {
+    itemSwapSlot
+  }
 
   protected def ContainableMoveItem(
                                    destination: PlanetSideServerObject with Container,
@@ -154,6 +164,7 @@ trait ContainableBehavior {
             LocalPutItemInSlot(item, dest) match {
               case Containable.ItemPutInSlot(_, _, _, None) => ; //success
               case Containable.ItemPutInSlot(_, _, _, Some(swapItem)) => //success, but with swap item
+                itemSwapSlot = dest
                 LocalPutItemInSlotOnlyOrAway(swapItem, slot) match {
                   case Containable.ItemPutInSlot(_, _, _, None) => ;
                   case _ =>
@@ -174,6 +185,7 @@ trait ContainableBehavior {
               case Success(Containable.ItemPutInSlot(_, _, _, None)) => ; //successful
 
               case Success(Containable.ItemPutInSlot(_, _, _, Some(swapItem))) => //successful, but with swap item
+                itemSwapSlot = dest
                 PutItBackOrDropIt(source, swapItem, slot, destination.Actor)
 
               case Success(_: Containable.CanNotPutItemInSlot) => //failure case ; try restore original item placement
@@ -184,10 +196,11 @@ trait ContainableBehavior {
 
               case _ => ; //TODO what?
             }
-            //always do this
-            moveItemOver
-              .recover { case _: AskTimeoutException => destination.Actor ! ContainableBehavior.Resume() }
-              .onComplete { _ => destination.Actor ! ContainableBehavior.Resume() }
+            /* Exactly one Resume answers the Wait() above, and onComplete alone delivers it
+               for both success and failure -- including an AskTimeoutException. A second
+               Resume would release an unrelated concurrent move's guard and let insertions
+               interleave with a move that is still in flight. */
+            moveItemOver.onComplete { _ => destination.Actor ! ContainableBehavior.Resume() }
           }
         case _ => ;
         //we could not find the item to be moved in the source location; trying to act on old data?
@@ -652,10 +665,11 @@ object ContainableBehavior {
     * A predicate used to determine if an `InventoryItem` object contains `Equipment` that should be dropped.
     * Used to filter through lists of object data before it is placed into a player's inventory.
     * Drop the item if:<br>
-    * - the item is cavern equipment<br>
     * - the item is a `BoomerTrigger` type object<br>
     * - the item is a `router_telepad` type object<br>
-    * - the item is another faction's exclusive equipment
+    * - the item is another faction's exclusive equipment<br>
+    * Additional equipment filtration information can be found attached to terminals.
+    * @see `ExclusionRule`
     * @param tplayer the player
     * @return true if the item is to be dropped; false, otherwise
     */
@@ -667,6 +681,19 @@ object ContainableBehavior {
       objDef == GlobalDefinitions.router_telepad ||
       entry.obj.isInstanceOf[BoomerTrigger] ||
       (faction != tplayer.Faction && faction != PlanetSideEmpire.NEUTRAL)
+    }
+
+  /**
+    * Same as above except the terminal used is from a facility that has cavern equipment benefit
+    * so allow cavern equipment to be kept
+    */
+  def DropPredicateEquipmentBenefit(tplayer: Player): InventoryItem => Boolean =
+    entry => {
+      val objDef  = entry.obj.Definition
+      val faction = GlobalDefinitions.isFactionEquipment(objDef)
+        objDef == GlobalDefinitions.router_telepad ||
+        entry.obj.isInstanceOf[BoomerTrigger] ||
+        (faction != tplayer.Faction && faction != PlanetSideEmpire.NEUTRAL)
     }
 }
 

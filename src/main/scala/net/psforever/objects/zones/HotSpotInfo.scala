@@ -2,7 +2,6 @@
 package net.psforever.objects.zones
 
 import net.psforever.types.{PlanetSideEmpire, Vector3}
-
 import scala.concurrent.duration._
 
 /**
@@ -15,9 +14,10 @@ import scala.concurrent.duration._
   */
 class HotSpotInfo(val DisplayLocation: Vector3) {
   private val activity: Map[PlanetSideEmpire.Value, ActivityReport] = Map(
-    PlanetSideEmpire.TR -> new ActivityReport(),
-    PlanetSideEmpire.NC -> new ActivityReport(),
-    PlanetSideEmpire.VS -> new ActivityReport()
+    PlanetSideEmpire.TR      -> new ActivityReport(),
+    PlanetSideEmpire.NC      -> new ActivityReport(),
+    PlanetSideEmpire.VS      -> new ActivityReport(),
+    PlanetSideEmpire.NEUTRAL -> new ActivityReport()
   )
 
   def Activity: Map[PlanetSideEmpire.Value, ActivityReport] = activity
@@ -64,6 +64,9 @@ class ActivityReport {
   /** heat increases each time the hotspot is considered active and receives more activity */
   private var heat: Int = 0
 
+  /** the time of the first activity report, when heat was last equal to zero */
+  private var firstReport: Option[Long] = None
+
   /** the time of the last activity report */
   private var lastReport: Option[Long] = None
 
@@ -99,7 +102,7 @@ class ActivityReport {
     * @return the time
     */
   def Duration_=(time: FiniteDuration): FiniteDuration = {
-    Duration_=(time.toNanos)
+    Duration_=(time.toMillis)
   }
 
   /**
@@ -109,8 +112,8 @@ class ActivityReport {
     * @return the time
     */
   def Duration_=(time: Long): FiniteDuration = {
-    if (time > duration.toNanos) {
-      duration = FiniteDuration(time, "nanoseconds")
+    if (time > duration.toMillis) {
+      duration = FiniteDuration(time, "milliseconds")
       Renew
     }
     Duration
@@ -122,7 +125,7 @@ class ActivityReport {
     * @return the current report
     */
   def Report(): ActivityReport = {
-    RaiseHeat(1)
+    RaiseHeat(addHeat = 1)
     Renew
     this
   }
@@ -134,6 +137,18 @@ class ActivityReport {
     */
   def Report(pow: Int): ActivityReport = {
     RaiseHeat(pow)
+    Renew
+    this
+  }
+
+  /**
+   * Submit new activity, increasing the lifespan of the current report's existence.
+   * @see `Renew`
+   * @return the current report
+   */
+  def Report(pow: Int, duration: FiniteDuration): ActivityReport = {
+    RaiseHeat(pow)
+    Duration = duration
     Renew
     this
   }
@@ -162,7 +177,8 @@ class ActivityReport {
     * @return the current time
     */
   def Renew: Long = {
-    val t = System.nanoTime
+    val t = System.currentTimeMillis()
+    firstReport = firstReport.orElse(Some(t))
     lastReport = Some(t)
     t
   }
@@ -173,7 +189,8 @@ class ActivityReport {
     */
   def Clear(): Unit = {
     heat = 0
+    firstReport = None
     lastReport = None
-    duration = FiniteDuration(0, "nanoseconds")
+    duration = FiniteDuration(0, "milliseconds")
   }
 }

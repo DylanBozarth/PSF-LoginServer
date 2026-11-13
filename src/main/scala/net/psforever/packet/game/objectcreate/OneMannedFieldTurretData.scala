@@ -39,7 +39,6 @@ final case class OneMannedFieldTurretData(
 }
 
 object OneMannedFieldTurretData extends Marshallable[OneMannedFieldTurretData] {
-
   /**
     * Overloaded constructor that mandates information about the internal weapon of the field turret.
     * @param deploy data common to objects spawned by the (advanced) adaptive construction engine
@@ -50,39 +49,32 @@ object OneMannedFieldTurretData extends Marshallable[OneMannedFieldTurretData] {
   def apply(deploy: CommonFieldDataWithPlacement, health: Int, internals: InventoryData): OneMannedFieldTurretData =
     new OneMannedFieldTurretData(deploy, health, Some(internals))
 
+  private def structureIfAlive(inHealth: Int, inInternals: Option[InventoryData]): (Int, Option[InventoryData]) = {
+    if (inHealth > 0 && inInternals.exists(_.contents.nonEmpty)) {
+      (inHealth, inInternals)
+    } else {
+      (0, None)
+    }
+  }
+
   implicit val codec: Codec[OneMannedFieldTurretData] = (
-    ("deploy" | CommonFieldDataWithPlacement.codec2) ::
+    ("deploy" | CommonFieldDataWithPlacement.codec_extra) ::
       PlanetSideGUID.codec :: //hoist/extract with the deploy.owner_guid in field above
       bool ::
       ("health" | uint8L) ::
-      uint(5) ::
+      uint(bits = 5) ::
       uint4 ::
       uint2 ::
-      optional(bool, "internals" | InventoryData.codec)
+      ("internals" | optional(bool, InventoryData.codec))
   ).exmap[OneMannedFieldTurretData](
     {
       case deploy :: player :: false :: health :: 0 :: 0xf :: 0 :: internals :: HNil =>
-        val (newHealth, newInternals) = if (health == 0 || internals.isEmpty || internals.get.contents.isEmpty) {
-          (0, None)
-        } else {
-          (health, internals)
-        }
-        val data = deploy.data
+        val (newHealth, newInternals) = structureIfAlive(health, internals)
         Attempt.successful(
           OneMannedFieldTurretData(
             CommonFieldDataWithPlacement(
               deploy.pos,
-              CommonFieldData(
-                data.faction,
-                data.bops,
-                data.alternate,
-                data.v1,
-                data.v2,
-                data.jammered,
-                data.v4,
-                data.v5,
-                player
-              )
+              deploy.data.copy(guid = player)
             ),
             newHealth,
             newInternals
@@ -94,25 +86,11 @@ object OneMannedFieldTurretData extends Marshallable[OneMannedFieldTurretData] {
     },
     {
       case OneMannedFieldTurretData(CommonFieldDataWithPlacement(pos, data), health, internals) =>
-        val (newHealth, newInternals) = if (health == 0 || internals.isEmpty || internals.get.contents.isEmpty) {
-          (0, None)
-        } else {
-          (health, internals)
-        }
+        val (newHealth, newInternals) = structureIfAlive(health, internals)
         Attempt.successful(
           CommonFieldDataWithPlacement(
             pos,
-            CommonFieldData(
-              data.faction,
-              data.bops,
-              data.alternate,
-              data.v1,
-              data.v2,
-              data.jammered,
-              data.v4,
-              data.v5,
-              PlanetSideGUID(0)
-            )
+            data.copy(guid = PlanetSideGUID(0))
           ) :: data.guid :: false :: newHealth :: 0 :: 0xf :: 0 :: newInternals :: HNil
         )
     }

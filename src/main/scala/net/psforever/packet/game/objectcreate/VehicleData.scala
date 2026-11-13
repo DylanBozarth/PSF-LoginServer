@@ -2,45 +2,9 @@
 package net.psforever.packet.game.objectcreate
 
 import net.psforever.packet.Marshallable
-import scodec.Attempt.{Failure, Successful}
 import scodec.{Attempt, Codec, Err}
 import shapeless.HNil
-import scodec.codecs._
-import net.psforever.types.DriveState
-
-/**
-  * An `Enumeration` of the various formats that known structures that the stream of bits for `VehicleData` can assume.
-  */
-object VehicleFormat extends Enumeration {
-  type Type = Value
-
-  val Battleframe, BattleframeFlight, Normal, Utility, Variant = Value
-}
-
-/**
-  * A basic `Trait` connecting all of the vehicle data formats (excepting `Normal`/`None`).
-  */
-sealed abstract class SpecificVehicleData(val format: VehicleFormat.Value) extends StreamBitSize
-
-/**
-  * The format of vehicle data for the type of vehicles that are considered "utility."
-  * The vehicles in this category are two:
-  * the advanced nanite transport, and
-  * the advanced mobile station.
-  * @param unk na
-  */
-final case class UtilityVehicleData(unk: Int) extends SpecificVehicleData(VehicleFormat.Utility) {
-  override def bitsize: Long = 6L
-}
-
-/**
-  * A common format variant of vehicle data.
-  * This category includes all flying vehicles and the ancient cavern vehicles.
-  * @param unk na
-  */
-final case class VariantVehicleData(unk: Int) extends SpecificVehicleData(VehicleFormat.Variant) {
-  override def bitsize: Long = 8L
-}
+import net.psforever.types.{DriveState, VehicleFormat}
 
 /**
   * A representation of a generic vehicle.
@@ -53,7 +17,7 @@ final case class VariantVehicleData(unk: Int) extends SpecificVehicleData(Vehicl
   *             -jammered - vehicles will not be jammered by setting this field<br>
   *             -player_guid the vehicle's (official) owner;
   *              a living player in the game world on the same continent as the vehicle who may mount the driver mount
-  * @param unk3 na
+  * @param boostMaxHealth vehicle gets 10% more armor from vehicle armor benefit given by Cyssor empire lock
   * @param health the amount of health the vehicle has, as a percentage of a filled bar (255)
   * @param unk4 na
   * @param no_mount_points do not display entry points for the seats
@@ -74,27 +38,25 @@ final case class VariantVehicleData(unk: Int) extends SpecificVehicleData(Vehicl
 final case class VehicleData(
     pos: PlacementData,
     data: CommonFieldData,
-    unk3: Boolean,
+    boostMaxHealth: Boolean,
     health: Int,
     unk4: Boolean,
     no_mount_points: Boolean,
-    driveState: DriveState.Value,
+    driveState: DriveState,
     unk5: Boolean,
     unk6: Boolean,
     cloak: Boolean,
     vehicle_format_data: Option[SpecificVehicleData],
     inventory: Option[InventoryData] = None
-)(val vehicle_type: VehicleFormat.Value = VehicleFormat.Normal)
+)(val vehicle_type: VehicleFormat = VehicleFormat.Normal)
     extends ConstructorData {
   override def bitsize: Long = {
     //factor guard bool values into the base size, not its corresponding optional field
     val posSize: Long  = pos.bitsize
     val dataSize: Long = data.bitsize
-    val extraBitsSize: Long = if (vehicle_format_data.isDefined) { vehicle_format_data.get.bitsize }
-    else { 0L }
-    val inventorySize = if (inventory.isDefined) { inventory.get.bitsize }
-    else { 0L }
-    23L + posSize + dataSize + extraBitsSize + inventorySize
+    val extraBitsSize: Long = vehicle_format_data.map(_.bitsize).getOrElse(0L)
+    val inventorySize: Long = inventory.map(_.bitsize).getOrElse(0L)
+    VehiclePatternData.bitsize + posSize + dataSize + extraBitsSize + inventorySize
   }
 }
 
@@ -111,11 +73,11 @@ object VehicleData extends Marshallable[VehicleData] {
       pos: PlacementData,
       basic: CommonFieldData,
       health: Int,
-      driveState: DriveState.Value,
+      driveState: DriveState,
       cloak: Boolean,
       inventory: Option[InventoryData]
   ): VehicleData = {
-    VehicleData(pos, basic, false, health, false, false, driveState, false, false, cloak, None, inventory)(
+    VehicleData(pos, basic, boostMaxHealth = false, health, unk4 = false, no_mount_points = false, driveState, unk5 = false, unk6 = false, cloak = cloak, None, inventory)(
       VehicleFormat.Normal
     )
   }
@@ -132,12 +94,12 @@ object VehicleData extends Marshallable[VehicleData] {
       pos: PlacementData,
       basic: CommonFieldData,
       health: Int,
-      driveState: DriveState.Value,
+      driveState: DriveState,
       cloak: Boolean,
       format: UtilityVehicleData,
       inventory: Option[InventoryData]
   ): VehicleData = {
-    VehicleData(pos, basic, false, health, false, false, driveState, false, false, cloak, Some(format), inventory)(
+    VehicleData(pos, basic, boostMaxHealth = false, health, unk4 = false, no_mount_points = false, driveState, unk5 = false, unk6 = false, cloak = cloak, Some(format), inventory)(
       VehicleFormat.Utility
     )
   }
@@ -154,96 +116,27 @@ object VehicleData extends Marshallable[VehicleData] {
       pos: PlacementData,
       basic: CommonFieldData,
       health: Int,
-      driveState: DriveState.Value,
+      driveState: DriveState,
       cloak: Boolean,
       format: VariantVehicleData,
       inventory: Option[InventoryData]
   ): VehicleData = {
-    VehicleData(pos, basic, false, health, false, false, driveState, false, false, cloak, Some(format), inventory)(
+    VehicleData(pos, basic, boostMaxHealth = false, health, unk4 = false, no_mount_points = false, driveState, unk5 = false, unk6 = false, cloak = cloak, Some(format), inventory)(
       VehicleFormat.Variant
     )
   }
 
-  private val driveState8u = uint8.xmap[DriveState.Value](
-    n => DriveState(n),
-    n => n.id
-  )
-
-  /**
-    * `Codec` for the "utility" format.
-    */
-  private val utility_data_codec: Codec[SpecificVehicleData] = {
-    import shapeless.::
-    uintL(6).hlist.exmap[SpecificVehicleData](
-      {
-        case n :: HNil =>
-          Successful(UtilityVehicleData(n).asInstanceOf[SpecificVehicleData])
-      },
-      {
-        case UtilityVehicleData(n) =>
-          Successful(n :: HNil)
-        case _ =>
-          Failure(Err("wrong kind of vehicle data object (wants 'Utility')"))
-      }
-    )
-  }
-
-  /**
-    * `Codec` for the "variant" format.
-    */
-  private val variant_data_codec: Codec[SpecificVehicleData] = {
-    import shapeless.::
-    uint8L.hlist.exmap[SpecificVehicleData](
-      {
-        case n :: HNil =>
-          Successful(VariantVehicleData(n).asInstanceOf[SpecificVehicleData])
-      },
-      {
-        case VariantVehicleData(n) =>
-          Successful(n :: HNil)
-        case _ =>
-          Failure(Err("wrong kind of vehicle data object (wants 'Variant')"))
-      }
-    )
-  }
-
-  /**
-    * Select an appropriate `Codec` in response to the requested stream format
-    * @param vehicleFormat the requested format
-    * @return the appropriate `Codec` for parsing that format
-    */
-  private def selectFormatReader(vehicleFormat: VehicleFormat.Value): Codec[SpecificVehicleData] =
-    vehicleFormat match {
-      case VehicleFormat.Utility =>
-        utility_data_codec
-      case VehicleFormat.Variant =>
-        variant_data_codec
-      case _ =>
-        Failure(Err(s"$vehicleFormat is not a valid vehicle format for parsing data"))
-          .asInstanceOf[Codec[SpecificVehicleData]]
-    }
-
-  def codec(vehicle_type: VehicleFormat.Value): Codec[VehicleData] = {
+  def codec(vehicle_type: VehicleFormat): Codec[VehicleData] = {
     import shapeless.::
     (
-      ("pos" | PlacementData.codec) >>:~ { pos =>
-        ("data" | CommonFieldData.codec2(false)) ::
-        ("unk3" | bool) ::
-        ("health" | uint8L) ::
-        ("unk4" | bool) :: //usually 0
-        ("no_mount_points" | bool) ::
-        ("driveState" | driveState8u) :: //used for deploy state
-        ("unk5" | bool) ::               //unknown but generally false; can cause stream misalignment if set when unexpectedly
-        ("unk6" | bool) ::
-        ("cloak" | bool) :: //cloak as wraith, phantasm
-        conditional(vehicle_type != VehicleFormat.Normal,"vehicle_format_data" | selectFormatReader(vehicle_type)) ::
-        optional(bool, target = "inventory" | MountableInventory.custom_inventory_codec(pos.vel.isDefined, VehicleFormat.Normal))
+      CommonFieldDataWithPlacement.codec_extra >>:~ { data =>
+        VehiclePatternData.codec(data.pos.vel.isDefined, vehicle_type).hlist
       }
     ).exmap[VehicleData](
       {
-        case pos :: data :: u3 :: health :: u4 :: no_mount :: driveState :: u5 :: u6 :: cloak :: format :: inv :: HNil =>
+        case vdata :: VehiclePatternData(u3, health, u4, no_mount, driveState, u5, u6, cloak, format, inv) :: HNil =>
           Attempt.successful(
-            new VehicleData(pos, data, u3, health, u4, no_mount, driveState, u5, u6, cloak, format, inv)(vehicle_type)
+            new VehicleData(vdata.pos, vdata.data, u3, health, u4, no_mount, driveState, u5, u6, cloak, format, inv)(vehicle_type)
           )
 
         case data =>
@@ -257,7 +150,7 @@ object VehicleData extends Marshallable[VehicleData] {
             Attempt.failure(Err(s"invalid vehicle data format; variable bits for ${obj.vehicle_type} expected"))
           } else {
             Attempt.successful(
-              pos :: data :: u3 :: health :: u4 :: no_mount :: driveState :: u5 :: u6 :: cloak :: format :: inv :: HNil
+              CommonFieldDataWithPlacement(pos, data) :: VehiclePatternData(u3, health, u4, no_mount, driveState, u5, u6, cloak, format, inv)(vehicle_type) :: HNil
             )
           }
       }

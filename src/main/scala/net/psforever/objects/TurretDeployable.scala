@@ -1,42 +1,68 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects
 
-import akka.actor.{Actor, ActorContext, Props}
-import net.psforever.objects.ce.{Deployable, DeployableBehavior, DeployedItem}
+import akka.actor.Actor
+import net.psforever.objects.ce.{Deployable, DeployableBehavior, InteractWithTurrets}
 import net.psforever.objects.definition.DeployableDefinition
 import net.psforever.objects.definition.converter.SmallTurretConverter
-import net.psforever.objects.equipment.{JammableMountedWeapons, JammableUnit}
+import net.psforever.objects.equipment.JammableUnit
 import net.psforever.objects.guid.{GUIDTask, TaskWorkflow}
-import net.psforever.objects.serverobject.PlanetSideServerObject
 import net.psforever.objects.serverobject.affinity.FactionAffinityBehavior
-import net.psforever.objects.serverobject.damage.Damageable.Target
-import net.psforever.objects.serverobject.damage.DamageableWeaponTurret
+import net.psforever.objects.serverobject.damage.Damageable
 import net.psforever.objects.serverobject.hackable.Hackable
-import net.psforever.objects.serverobject.mount.{Mountable, MountableBehavior}
-import net.psforever.objects.serverobject.repair.RepairableWeaponTurret
-import net.psforever.objects.serverobject.turret.{TurretDefinition, WeaponTurret}
+import net.psforever.objects.serverobject.mount.interaction.{InteractWithForceDomeProtectionSeatedInEntity, InteractWithRadiationCloudsSeatedInEntity}
+import net.psforever.objects.serverobject.turret.auto.{AffectedByAutomaticTurretFire, AutomatedTurret}
+import net.psforever.objects.serverobject.turret.{TurretControl, TurretDefinition, WeaponTurret}
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
 import net.psforever.objects.vital.damage.DamageCalculations
 import net.psforever.objects.vital.interaction.DamageResult
+import net.psforever.objects.vital.resistance.StandardResistanceProfile
 import net.psforever.objects.vital.{SimpleResolutions, StandardVehicleResistance}
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.objects.zones.interaction.InteractsWithZone
+import net.psforever.packet.game.packets.TriggeredSound
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.vehicle.VehicleAction
 
 import scala.concurrent.duration.FiniteDuration
 
 class TurretDeployable(tdef: TurretDeployableDefinition)
-    extends Deployable(tdef)
+  extends Deployable(tdef)
+    with AutomatedTurret
     with WeaponTurret
     with JammableUnit
+    with InteractsWithZone
+    with StandardResistanceProfile
     with Hackable {
-  WeaponTurret.LoadDefinition(this)
+  HackSound = TriggeredSound.HackVehicle
+  HackDuration = Array(0, 20, 10, 5)
 
-  override def Definition = tdef
+  if (tdef.Seats.nonEmpty) {
+    interaction(new InteractWithForceDomeProtectionSeatedInEntity)
+    interaction(new InteractWithTurrets())
+    interaction(new InteractWithRadiationCloudsSeatedInEntity(obj = this, range = 100f))
+  }
+  WeaponTurret.LoadDefinition(turret = this)
+
+  def TurretOwner: SourceEntry = {
+    Seats
+      .values
+      .headOption
+      .flatMap(_.occupant)
+      .map(p => PlayerSource.inSeat(PlayerSource(p), SourceEntry(this), seatNumber=0))
+      .orElse(Owners.map(PlayerSource(_, Position)))
+      .getOrElse(SourceEntry(this))
+  }
+
+  override def MaxShields: Int = Definition.MaxShields
+
+  override def Definition: TurretDeployableDefinition = tdef
 }
 
-class TurretDeployableDefinition(private val objectId: Int)
+abstract class TurretDeployableDefinition(private val objectId: Int)
     extends DeployableDefinition(objectId)
     with TurretDefinition {
   Name = "turret_deployable"
-  Packet = new SmallTurretConverter
+  Packet = SmallTurretConverter
   DamageUsing = DamageCalculations.AgainstVehicle
   ResistUsing = StandardVehicleResistance
   Model = SimpleResolutions.calculate
@@ -45,84 +71,50 @@ class TurretDeployableDefinition(private val objectId: Int)
   override def MaxHealth: Int = super[DeployableDefinition].MaxHealth
   //override to clarify inheritance conflict
   override def MaxHealth_=(max: Int): Int = super[DeployableDefinition].MaxHealth_=(max)
-
-  override def Initialize(obj: Deployable, context: ActorContext) = {
-    obj.Actor = context.actorOf(Props(classOf[TurretControl], obj), PlanetSideServerObject.UniqueActorName(obj))
-  }
-}
-
-object TurretDeployableDefinition {
-  def apply(dtype: DeployedItem.Value): TurretDeployableDefinition = {
-    new TurretDeployableDefinition(dtype.id)
-  }
 }
 
 /** control actors */
 
-class TurretControl(turret: TurretDeployable)
+abstract class TurretDeployableControl
     extends Actor
     with DeployableBehavior
     with FactionAffinityBehavior.Check
-    with JammableMountedWeapons //note: jammable status is reported as vehicle events, not local events
-    with MountableBehavior
-    with DamageableWeaponTurret
-    with RepairableWeaponTurret {
-  def DeployableObject = turret
-  def MountableObject  = turret
-  def JammableObject   = turret
-  def FactionObject    = turret
-  def DamageableObject = turret
-  def RepairableObject = turret
+    with TurretControl
+    with AffectedByAutomaticTurretFire {
 
   override def postStop(): Unit = {
     super.postStop()
     deployableBehaviorPostStop()
-    damageableWeaponTurretPostStop()
   }
 
-  def receive: Receive =
-    deployableBehavior
+  override def commonBehavior: Receive =
+    super.commonBehavior
+      .orElse(deployableBehavior)
       .orElse(checkBehavior)
-      .orElse(jammableBehavior)
-      .orElse(mountBehavior)
-      .orElse(dismountBehavior)
-      .orElse(takesDamage)
-      .orElse(canBeRepairedByNanoDispenser)
-      .orElse {
-        case _ => ;
-      }
+      .orElse(takeAutomatedDamage)
 
-  override protected def mountTest(
-                                    obj: PlanetSideServerObject with Mountable,
-                                    seatNumber: Int,
-                                    player: Player): Boolean = {
-    (!turret.Definition.FactionLocked || player.Faction == obj.Faction) && !obj.Destroyed
-  }
-
-  override protected def DestructionAwareness(target: Target, cause: DamageResult): Unit = {
+  override protected def DestructionAwareness(target: Damageable.Target, cause: DamageResult): Unit = {
     super.DestructionAwareness(target, cause)
-    CancelJammeredSound(target)
-    CancelJammeredStatus(target)
-    Deployables.AnnounceDestroyDeployable(turret, None)
+    Deployables.AnnounceDestroyDeployable(DeployableObject, None)
   }
 
   override def deconstructDeployable(time: Option[FiniteDuration]) : Unit = {
-    val zone = turret.Zone
-    val seats = turret.Seats.values
+    val zone = TurretObject.Zone
+    val seats = TurretObject.Seats.values
     //either we have no seats or no one gets to sit
     val retime = if (seats.count(_.isOccupied) > 0) {
-      //unlike with vehicles, it's possible to request deconstruction of one's own field turret while seated in it
+      //it's possible to request deconstruction of one's own field turret while seated in it
       val wasKickedByDriver = false
       seats.foreach { seat =>
-        seat.occupant match {
-          case Some(tplayer) =>
-            seat.unmount(tplayer)
-            tplayer.VehicleSeated = None
-            zone.VehicleEvents ! VehicleServiceMessage(
+        seat.occupant.collect {
+          case player: Player =>
+            seat.unmount(player)
+            player.VehicleSeated = None
+            zone.VehicleEvents ! MessageEnvelope(
               zone.id,
-              VehicleAction.KickPassenger(tplayer.GUID, 4, wasKickedByDriver, turret.GUID)
+              player.GUID,
+              VehicleAction.KickPassenger(4, wasKickedByDriver, TurretObject.GUID)
             )
-          case None => ;
         }
       }
       Some(time.getOrElse(Deployable.cleanup) + Deployable.cleanup)
@@ -134,6 +126,6 @@ class TurretControl(turret: TurretDeployable)
 
   override def unregisterDeployable(obj: Deployable): Unit = {
     val zone = obj.Zone
-    TaskWorkflow.execute(GUIDTask.unregisterDeployableTurret(zone.GUID, turret))
+    TaskWorkflow.execute(GUIDTask.unregisterDeployableTurret(zone.GUID, TurretObject))
   }
 }

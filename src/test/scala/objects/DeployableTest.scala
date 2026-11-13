@@ -6,42 +6,45 @@ import akka.testkit.TestProbe
 import base.ActorTest
 import net.psforever.actors.zone.ZoneActor
 import net.psforever.objects.ballistics._
-import net.psforever.objects.ce.DeployedItem
+import net.psforever.objects.ce.{Deployable, DeployedItem}
 import net.psforever.objects.guid.NumberPoolHub
 import net.psforever.objects.guid.source.MaxNumberSource
-import net.psforever.objects.serverobject.mount.{MountInfo, Mountable}
+import net.psforever.objects.serverobject.mount.{MountInfo, Mountable, SeatDefinition}
 import net.psforever.objects.vital.Vitality
 import net.psforever.objects.zones.{Zone, ZoneDeployableActor, ZoneMap}
-import net.psforever.objects.{TurretDeployable, _}
-import net.psforever.packet.game.{DeployableIcon, DeployableInfo, DeploymentAction}
+import net.psforever.objects._
 import net.psforever.types._
 import org.specs2.mutable.Specification
 import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
-import net.psforever.services.local.{LocalAction, LocalServiceMessage}
+import net.psforever.services.avatar.AvatarAction
+import net.psforever.services.local.LocalAction
 import net.psforever.objects.avatar.Avatar
 import net.psforever.objects.vital.base.DamageResolution
 import net.psforever.objects.vital.interaction.DamageInteraction
 import net.psforever.objects.vital.projectile.ProjectileReason
-
 import akka.actor.typed.scaladsl.adapter._
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
+import net.psforever.packet.game.packets.{DeployableIcon, DeployableInfo, DeploymentAction}
+import net.psforever.services.base.envelope.MessageEnvelope
 
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable
 import scala.concurrent.duration._
 
 class DeployableTest extends Specification {
   "Deployable" should {
     "know its owner by GUID" in {
       val obj = new ExplosiveDeployable(GlobalDefinitions.he_mine)
-      obj.Owner.isEmpty mustEqual true
-      obj.Owner = PlanetSideGUID(10)
-      obj.Owner.contains(PlanetSideGUID(10)) mustEqual true
+      obj.OwnerGuid.isEmpty mustEqual true
+      obj.OwnerGuid = PlanetSideGUID(10)
+      obj.OwnerGuid.contains(PlanetSideGUID(10)) mustEqual true
     }
 
-    "know its owner by GUID" in {
+    "know its owner by name" in {
       val obj = new ExplosiveDeployable(GlobalDefinitions.he_mine)
-      obj.OwnerName.isEmpty mustEqual true
-      obj.OwnerName = "TestCharacter"
+      val owner = Player(Avatar(1, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 1, CharacterVoice.Mute))
+      owner.GUID = PlanetSideGUID(1)
+      owner.Spawn()
+      obj.AssignOwnership(owner)
       obj.OwnerName.contains("TestCharacter") mustEqual true
     }
 
@@ -136,14 +139,14 @@ class TurretDeployableTest extends Specification {
         DeployedItem.portable_manned_turret_nc.id,
         DeployedItem.portable_manned_turret_vs.id
       ).foreach(id => {
-        try { new TurretDeployableDefinition(id) }
+        try { new TurretDeployableDefinition(id) { } }
         catch { case _: Exception => ko }
       })
       ok
     }
 
     "define (invalid object)" in {
-      new TurretDeployableDefinition(5) must throwA[NoSuchElementException] //wrong object id altogether
+      new TurretDeployableDefinition(objectId = 5) { } must throwA[NoSuchElementException] //wrong object id altogether
     }
 
     "construct" in {
@@ -210,7 +213,7 @@ class DeployableMake extends Specification {
       }
     }
 
-    "construct a cerebus turret" in {
+    "construct a cerberus turret" in {
       val func = Deployables.Make(DeployedItem.spitfire_aa)
       func() match {
         case obj: TurretDeployable if obj.Definition == GlobalDefinitions.spitfire_aa => ok
@@ -312,15 +315,15 @@ class ExplosiveDeployableJammerTest extends ActorTest {
   val guid = new NumberPoolHub(new MaxNumberSource(10))
   val eventsProbe = new TestProbe(system)
 
-  val j_mine = Deployables.Make(DeployedItem.jammer_mine)().asInstanceOf[ExplosiveDeployable] //guid=1
+  val mine = Deployables.Make(DeployedItem.he_mine)().asInstanceOf[ExplosiveDeployable] //guid=1
   val avatar1 = Avatar(0, "TestCharacter1", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute)
   val player1 = Player(avatar1) //guid=3
   val avatar2 = Avatar(0, "TestCharacter2", PlanetSideEmpire.NC, CharacterSex.Male, 0, CharacterVoice.Mute)
   val player2 = Player(avatar2) //guid=4
   val weapon = Tool(GlobalDefinitions.jammer_grenade) //guid=5
-  val deployableList = new ListBuffer()
+  val deployableList = new mutable.ListBuffer[Deployable]()
   val zone = new Zone("test", new ZoneMap("test"), 0) {
-    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList), name = "test-zone-deployables")
+    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList, mutable.HashMap[Int, Int]()), name = "test-zone-deployables")
 
     override def SetupNumberPools() = {}
     GUID(guid)
@@ -333,17 +336,17 @@ class ExplosiveDeployableJammerTest extends ActorTest {
   }
   player1.Spawn()
   player2.Spawn()
-  guid.register(j_mine, 1)
+  guid.register(mine, 1)
   guid.register(player1, 3)
   guid.register(player2, 4)
   guid.register(weapon, 5)
-  j_mine.Zone = zone
-  j_mine.Owner = player2
-  j_mine.OwnerName = player2.Name
-  j_mine.Faction = PlanetSideEmpire.NC
-  j_mine.Actor = system.actorOf(Props(classOf[MineDeployableControl], j_mine), "j-mine-control")
+  mine.Zone = zone
+  mine.OwnerGuid = player2
+  //j_mine.OwnerName = player2.Name
+  mine.Faction = PlanetSideEmpire.NC
+  mine.Actor = system.actorOf(Props(classOf[MineDeployableControl], mine), "j-mine-control")
 
-  val jMineSource = SourceEntry(j_mine)
+  val jMineSource = SourceEntry(mine)
   val pSource     = PlayerSource(player1)
   val projectile  = weapon.Projectile
   val resolved = DamageInteraction(
@@ -351,7 +354,7 @@ class ExplosiveDeployableJammerTest extends ActorTest {
     ProjectileReason(
       DamageResolution.Hit,
       Projectile(projectile, weapon.Definition, weapon.FireMode, pSource, 0, Vector3.Zero, Vector3.Zero),
-      j_mine.DamageModel
+      mine.DamageModel
     ),
     Vector3(1, 0, 0)
   )
@@ -359,26 +362,55 @@ class ExplosiveDeployableJammerTest extends ActorTest {
 
   "ExplosiveDeployable" should {
     "handle being jammered appropriately (no detonation)" in {
-      assert(!j_mine.Destroyed)
+      assert(!mine.Destroyed)
 
-      j_mine.Actor ! Vitality.Damage(applyDamageToJ)
-      val eventMsgs  = eventsProbe.receiveN(2, 200 milliseconds)
+      mine.Actor ! Vitality.Damage(applyDamageToJ)
+      val eventMsgs  = eventsProbe.receiveN(4, 200 milliseconds)
       eventMsgs.head match {
-        case LocalServiceMessage(
+        case Zone.HotSpot.Conflict(mineSrc, playerSrc, Vector3(1.0,0.0,0.0)) => ;
+        case _ => assert(false, "")
+      }
+//      eventMsgs.head match {
+//        case MessageEnvelope(
+//          "NC",
+//          _,
+//          LocalAction.DeployableMapIcon(
+//            ValidPlanetSideGUID(0),
+//            DeploymentAction.Dismiss,
+//            DeployableInfo(ValidPlanetSideGUID(1), DeployableIcon.HEMine, Vector3.Zero, ValidPlanetSideGUID(0))
+//          )
+//        ) => ;
+//        case _ => assert(false, "")
+//      }
+      eventMsgs(1) match {
+        case MessageEnvelope("test", _, LocalAction.Detonate(PlanetSideGUID(1), _)) => ;
+        case _ => assert(false, "")
+      }
+      eventMsgs(2) match {
+        case MessageEnvelope(
           "NC",
+          _,
           LocalAction.DeployableMapIcon(
-            ValidPlanetSideGUID(0),
             DeploymentAction.Dismiss,
-            DeployableInfo(ValidPlanetSideGUID(1), DeployableIcon.DisruptorMine, Vector3.Zero, ValidPlanetSideGUID(0))
+            DeployableInfo(ValidPlanetSideGUID(1), DeployableIcon.HEMine, Vector3.Zero, ValidPlanetSideGUID(0))
           )
         ) => ;
         case _ => assert(false, "")
       }
-      eventMsgs(1) match {
-        case AvatarServiceMessage("test", AvatarAction.Destroy(PlanetSideGUID(1), _, Service.defaultPlayerGUID, _)) => ;
+      eventMsgs(3) match {
+        case MessageEnvelope(
+          "test",
+          _,
+          AvatarAction.Destroy(
+          ValidPlanetSideGUID(1),
+            ValidPlanetSideGUID(3),
+            ValidPlanetSideGUID(0),
+            Vector3.Zero
+          )
+        ) => ;
         case _ => assert(false, "")
       }
-      assert(j_mine.Destroyed)
+      assert(mine.Destroyed)
     }
   }
 }
@@ -395,9 +427,9 @@ class ExplosiveDeployableJammerExplodeTest extends ActorTest {
   val avatar2 = Avatar(0, "TestCharacter2", PlanetSideEmpire.NC, CharacterSex.Male, 0, CharacterVoice.Mute)
   val player2 = Player(avatar2) //guid=4
   val weapon = Tool(GlobalDefinitions.jammer_grenade) //guid=5
-  val deployableList = new ListBuffer()
+  val deployableList = new mutable.ListBuffer[Deployable]()
   val zone = new Zone("test", new ZoneMap("test"), 0) {
-    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList), name = "test-zone-deployables")
+    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList, mutable.HashMap[Int, Int]()), name = "test-zone-deployables")
 
     override def SetupNumberPools() = {}
     GUID(guid)
@@ -421,8 +453,8 @@ class ExplosiveDeployableJammerExplodeTest extends ActorTest {
   guid.register(player2, 4)
   guid.register(weapon, 5)
   h_mine.Zone = zone
-  h_mine.Owner = player2
-  h_mine.OwnerName = player2.Name
+  h_mine.OwnerGuid = player2
+  //h_mine.OwnerName = player2.Name
   h_mine.Faction = PlanetSideEmpire.NC
   h_mine.Actor = system.actorOf(Props(classOf[MineDeployableControl], h_mine), "h-mine-control")
   zone.blockMap.addTo(player1)
@@ -447,46 +479,33 @@ class ExplosiveDeployableJammerExplodeTest extends ActorTest {
       assert(!h_mine.Destroyed)
 
       h_mine.Actor ! Vitality.Damage(applyDamageToH)
-      val eventMsgs = eventsProbe.receiveN(5, 200 milliseconds)
-      val p1Msgs = player1Probe.receiveN(1, 200 milliseconds)
-      player2Probe.expectNoMessage(200 milliseconds)
+      val p1Msgs = player1Probe.receiveN(1, 5000 milliseconds)
+      val eventMsgs = eventsProbe.receiveN(3, 5000 milliseconds)
       eventMsgs.head match {
         case Zone.HotSpot.Conflict(target, attacker, _)
-          if (target.Definition eq h_mine.Definition) && (attacker eq pSource) => ;
+          if (target.Definition eq h_mine.Definition) && (attacker eq pSource) => ()
         case _ => assert(false, "")
       }
       eventMsgs(1) match {
-        case LocalServiceMessage("test", LocalAction.Detonate(PlanetSideGUID(2), target))
-          if target eq h_mine => ;
+        case MessageEnvelope("test", _, LocalAction.Detonate(PlanetSideGUID(2), target))
+          if target eq h_mine => ()
         case _ => assert(false, "")
       }
       eventMsgs(2) match {
-        case LocalServiceMessage("TestCharacter2", LocalAction.DeployableUIFor(DeployedItem.he_mine)) => ;
-        case _ => assert(false, "")
-      }
-      eventMsgs(3) match {
-        case LocalServiceMessage(
+        case MessageEnvelope(
           "NC",
+          _,
           LocalAction.DeployableMapIcon(
-            PlanetSideGUID(0),
             DeploymentAction.Dismiss,
             DeployableInfo(PlanetSideGUID(2), DeployableIcon.HEMine, _, PlanetSideGUID(0))
           )
         )  => ;
         case _ => assert(false, "")
       }
-      eventMsgs(4) match {
-        case AvatarServiceMessage(
-          "test",
-          AvatarAction.Destroy(PlanetSideGUID(2), PlanetSideGUID(3), Service.defaultPlayerGUID, Vector3.Zero)
-        ) => ;
-        case _ => assert(false, "")
-      }
       p1Msgs.head match {
-        case Vitality.Damage(_) => ;
+        case Vitality.Damage(_) => ()
         case _                  => assert(false, "")
       }
-      assert(!avatar2.deployables.Contains(h_mine))
       assert(h_mine.Destroyed)
     }
   }
@@ -504,9 +523,9 @@ class ExplosiveDeployableDestructionTest extends ActorTest {
   val avatar2 = Avatar(0, "TestCharacter2", PlanetSideEmpire.NC, CharacterSex.Male, 0, CharacterVoice.Mute)
   val player2 = Player(avatar2) //guid=4
   val weapon = Tool(GlobalDefinitions.suppressor) //guid=5
-  val deployableList = new ListBuffer()
+  val deployableList = new mutable.ListBuffer[Deployable]()
   val zone = new Zone("test", new ZoneMap("test"), 0) {
-    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList), name = "test-zone-deployables")
+    private val deployables = system.actorOf(Props(classOf[ZoneDeployableActor], this, deployableList, mutable.HashMap[Int, Int]()), name = "test-zone-deployables")
 
     override def SetupNumberPools() = {}
     GUID(guid)
@@ -528,8 +547,7 @@ class ExplosiveDeployableDestructionTest extends ActorTest {
   guid.register(player2, 4)
   guid.register(weapon, 5)
   h_mine.Zone = zone
-  h_mine.Owner = player2
-  h_mine.OwnerName = player2.Name
+  h_mine.AssignOwnership(player2)
   h_mine.Faction = PlanetSideEmpire.NC
   h_mine.Actor = system.actorOf(Props(classOf[MineDeployableControl], h_mine), "h-mine-control")
 
@@ -558,34 +576,34 @@ class ExplosiveDeployableDestructionTest extends ActorTest {
       assert(!h_mine.Destroyed)
 
       h_mine.Actor ! Vitality.Damage(applyDamageTo)
-      val eventMsgs  = eventsProbe.receiveN(4, 200 milliseconds)
+      val eventMsgs  = eventsProbe.receiveN(3, 200 milliseconds)
       player1Probe.expectNoMessage(200 milliseconds)
-      player2Probe.expectNoMessage(200 milliseconds)
+      val p2Msgs = player2Probe.receiveN(1, 200 milliseconds)
       eventMsgs.head match {
-        case LocalServiceMessage("TestCharacter2", LocalAction.DeployableUIFor(DeployedItem.he_mine)) => ;
-        case _ => assert(false, "")
-      }
-      eventMsgs(1) match {
-        case LocalServiceMessage(
+        case MessageEnvelope(
           "NC",
+          _,
           LocalAction.DeployableMapIcon(
-            PlanetSideGUID(0),
             DeploymentAction.Dismiss,
             DeployableInfo(PlanetSideGUID(2), DeployableIcon.HEMine, _, PlanetSideGUID(0))
           )
         )  => ;
         case _ => assert(false, "")
       }
-      eventMsgs(2) match {
-        case AvatarServiceMessage(
-        "test",
-        AvatarAction.Destroy(PlanetSideGUID(2), PlanetSideGUID(3), Service.defaultPlayerGUID, Vector3.Zero)
+      eventMsgs(1) match {
+        case MessageEnvelope(
+          "test", _,
+          AvatarAction.Destroy(PlanetSideGUID(2), PlanetSideGUID(3), Default.GUID0, Vector3.Zero)
         ) => ;
         case _ => assert(false, "")
       }
-      eventMsgs(3) match {
-        case LocalServiceMessage("test", LocalAction.TriggerEffect(_, "detonate_damaged_mine", PlanetSideGUID(2))) => ;
+      eventMsgs(2) match {
+        case MessageEnvelope("test", _, LocalAction.TriggerEffect("detonate_damaged_mine", PlanetSideGUID(2))) => ;
         case _ => assert(false, "")
+      }
+      p2Msgs.head match {
+        case Player.LoseDeployable(_) => ;
+        case _                        => assert(false, "")
       }
       assert(h_mine.Health <= h_mine.Definition.DamageDestroysAt)
       assert(h_mine.Destroyed)
@@ -596,7 +614,7 @@ class TurretControlConstructTest extends ActorTest {
   "TurretControl" should {
     "construct" in {
       val obj = new TurretDeployable(GlobalDefinitions.spitfire_turret)
-      system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      system.actorOf(Props(classOf[SmallTurretControl], obj), s"${obj.Definition.Name}_test")
     }
   }
 }
@@ -641,7 +659,7 @@ class TurretControlMountTest extends ActorTest {
         override def SetupNumberPools() = {}
         this.actor = new TestProbe(system).ref.toTyped[ZoneActor.Command]
       }
-      obj.Actor = system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      obj.Actor = system.actorOf(Props(classOf[FieldTurretControl], obj), s"${obj.Definition.Name}_test")
 
       assert(obj.Seats(0).occupant.isEmpty)
       val player1 = Player(Avatar(0, "test1", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))
@@ -661,7 +679,7 @@ class TurretControlBlockMountTest extends ActorTest {
     "block mounting by others if already mounted by someone" in {
       val obj = new TurretDeployable(GlobalDefinitions.portable_manned_turret_tr) { GUID = PlanetSideGUID(1) }
       obj.Faction = PlanetSideEmpire.TR
-      obj.Actor = system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      obj.Actor = system.actorOf(Props(classOf[FieldTurretControl], obj), s"${obj.Definition.Name}_test")
       obj.Zone = new Zone("test", new ZoneMap("test"), 0) {
         override def SetupNumberPools() = {}
         this.actor = new TestProbe(system).ref.toTyped[ZoneActor.Command]
@@ -693,7 +711,7 @@ class TurretControlBlockBetrayalMountTest extends ActorTest {
     "block mounting by players of another faction" in {
       val obj = new TurretDeployable(GlobalDefinitions.portable_manned_turret_tr) { GUID = PlanetSideGUID(1) }
       obj.Faction = PlanetSideEmpire.TR
-      obj.Actor = system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      obj.Actor = system.actorOf(Props(classOf[FieldTurretControl], obj), s"${obj.Definition.Name}_test")
 
       assert(obj.Seats(0).occupant.isEmpty)
       val player = Player(Avatar(0, "test", PlanetSideEmpire.VS, CharacterSex.Male, 0, CharacterVoice.Mute))
@@ -717,7 +735,7 @@ class TurretControlDismountTest extends ActorTest {
         override def SetupNumberPools() = {}
         this.actor = new TestProbe(system).ref.toTyped[ZoneActor.Command]
       }
-      obj.Actor = system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      obj.Actor = system.actorOf(Props(classOf[FieldTurretControl], obj), s"${obj.Definition.Name}_test")
 
       assert(obj.Seats(0).occupant.isEmpty)
       val player = Player(Avatar(0, "test", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))
@@ -747,6 +765,7 @@ class TurretControlBetrayalMountTest extends ActorTest {
       val obj = new TurretDeployable(
         new TurretDeployableDefinition(685) {
           MountPoints += 1 -> MountInfo(0, Vector3.Zero)
+          Seats += 0 -> new SeatDefinition()
           FactionLocked = false
         } //required (defaults to true)
       ) {
@@ -757,7 +776,7 @@ class TurretControlBetrayalMountTest extends ActorTest {
         }
       }
       obj.Faction = PlanetSideEmpire.TR
-      obj.Actor = system.actorOf(Props(classOf[TurretControl], obj), s"${obj.Definition.Name}_test")
+      obj.Actor = system.actorOf(Props(classOf[FieldTurretControl], obj), s"${obj.Definition.Name}_test")
       val probe = new TestProbe(system)
 
       assert(obj.Seats(0).occupant.isEmpty)

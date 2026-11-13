@@ -2,41 +2,30 @@
 package net.psforever.objects.definition.converter
 
 import net.psforever.objects.equipment.{Equipment, EquipmentSlot}
-import net.psforever.objects.{PlanetSideGameObject, Vehicle}
+import net.psforever.objects.{Default, PlanetSideGameObject, Vehicle}
 import net.psforever.packet.game.objectcreate._
-import net.psforever.types.{DriveState, PlanetSideGUID}
+import net.psforever.types.{DriveState, VehicleFormat}
+import net.psforever.zones.Zones
 
 import scala.util.{Failure, Success, Try}
 
-class VehicleConverter extends ObjectCreateConverter[Vehicle]() {
+trait BasicVehicleConverter extends ObjectCreateConverter[Vehicle] {
   override def DetailedConstructorData(obj: Vehicle): Try[VehicleData] =
     Failure(new Exception("VehicleConverter should not be used to generate detailed VehicleData (nothing should)"))
 
   override def ConstructorData(obj: Vehicle): Try[VehicleData] = {
     val health = StatConverter.Health(obj.Health, obj.MaxHealth)
+    val boosted = Zones.zones.find(_.Number == 3).exists(_.benefitRecipient == obj.Faction)
     if (health > 0) { //active
       Success(
         VehicleData(
           PlacementData(obj.Position, obj.Orientation, obj.Velocity),
-          CommonFieldData(
-            obj.Faction,
-            bops = false,
-            alternate = false,
-            v1 = false,
-            v2 = None,
-            jammered = obj.Jammed,
-            v4 = Some(false),
-            v5 = None,
-            obj.Owner match {
-              case Some(owner) => owner
-              case None        => PlanetSideGUID(0)
-            }
-          ),
-          unk3 = false,
+          CommonFieldData(faction = obj.Faction, bops = false, alternate = false, v1 = false, v2 = Some(CommonFieldDataExtra.Default), jammered = obj.Jammed, v5 = None, guid = GetOwner(obj)),
+          boostMaxHealth = boosted,
           health,
           unk4 = false,
           no_mount_points = false,
-          obj.DeploymentState,
+          SterilizedDeploymentState(obj),
           unk5 = false,
           unk6 = false,
           obj.Cloaked,
@@ -48,18 +37,8 @@ class VehicleConverter extends ObjectCreateConverter[Vehicle]() {
       Success(
         VehicleData(
           PlacementData(obj.Position, obj.Orientation),
-          CommonFieldData(
-            obj.Faction,
-            bops = false,
-            alternate = true,
-            v1 = false,
-            v2 = None,
-            jammered = obj.Jammed,
-            v4 = Some(false),
-            v5 = None,
-            guid = PlanetSideGUID(0)
-          ),
-          unk3 = false,
+          CommonFieldData(obj.Faction, bops = false, alternate = true, v1 = false, v2 = Some(CommonFieldDataExtra.Default), jammered = false, v5 = None, guid = Default.GUID0),
+          boostMaxHealth = boosted,
           health = 0,
           unk4 = false,
           no_mount_points = true,
@@ -75,9 +54,9 @@ class VehicleConverter extends ObjectCreateConverter[Vehicle]() {
   }
 
   private def MakeDriverSeat(obj: Vehicle): List[InventoryItemData.InventoryItem] = {
-    val offset: Long = MountableInventory.InitialStreamLengthToSeatEntries(obj.Velocity.nonEmpty, SpecificFormatModifier)
     obj.Seats(0).occupant match {
       case Some(player) =>
+        val offset: Long = MountableInventory.InitialStreamLengthToSeatEntries(obj.Velocity.nonEmpty, SpecificFormatModifier)
         List(InventoryItemData(ObjectClass.avatar, player.GUID, 0, SeatConverter.MakeSeat(player, offset)))
       case None =>
         Nil
@@ -105,7 +84,16 @@ class VehicleConverter extends ObjectCreateConverter[Vehicle]() {
       .toList
   }
 
-  protected def SpecificFormatModifier: VehicleFormat.Value = VehicleFormat.Normal
+  private def SterilizedDeploymentState(obj: Vehicle): DriveState = {
+    obj.DeploymentState match {
+      case state if state.id < 0 => DriveState.Mobile
+      case state => state
+    }
+  }
+
+  protected def SpecificFormatModifier: VehicleFormat = VehicleFormat.Normal
 
   protected def SpecificFormatData(obj: Vehicle): Option[SpecificVehicleData] = None
 }
+
+object VehicleConverter extends BasicVehicleConverter

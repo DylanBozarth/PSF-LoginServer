@@ -11,10 +11,10 @@ import net.psforever.objects.serverobject.repair.{AmenityAutoRepair, Repairable,
 import net.psforever.objects.serverobject.terminals.{GeneratorTerminalDefinition, Terminal}
 import net.psforever.objects.vital.interaction.DamageResult
 import net.psforever.objects.zones.Zone
-import net.psforever.packet.game.TriggerEffectMessage
+import net.psforever.packet.game.packets.TriggerEffectMessage
+import net.psforever.services.base.envelope.MessageEnvelope
 import net.psforever.types.{PlanetSideGeneratorState, Vector3}
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.services.base.message.SendResponse
 
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -30,10 +30,10 @@ class GeneratorControl(gen: Generator)
     with DamageableEntity
     with RepairableEntity
     with AmenityAutoRepair {
-  def FactionObject      = gen
-  def DamageableObject   = gen
-  def RepairableObject   = gen
-  def AutoRepairObject   = gen
+  def FactionObject: Generator    = gen
+  def DamageableObject: Generator = gen
+  def RepairableObject: Generator = gen
+  def AutoRepairObject: Generator = gen
   /** flagged to explode after some time */
   var imminentExplosion: Boolean   = false
   /** explode when this timer completes */
@@ -111,21 +111,18 @@ class GeneratorControl(gen: Generator)
           super.DestructionAwareness(gen, gen.LastDamage.get)
           GeneratorControl.UpdateOwner(gen, Some(GeneratorControl.Event.Destroyed))
           //kaboom
-          zone.AvatarEvents ! AvatarServiceMessage(
+          zone.AvatarEvents ! MessageEnvelope(
             zone.id,
-            AvatarAction.SendResponse(
-              Service.defaultPlayerGUID,
-              TriggerEffectMessage(gen.GUID, "explosion_generator", None, None)
-            )
+            SendResponse(TriggerEffectMessage(gen.GUID, "explosion_generator", None, None))
           )
           queuedExplosion.cancel()
           queuedExplosion = Default.Cancellable
           imminentExplosion = false
           //hate on everything nearby
-          Zone.serverSideDamage(gen.Zone, gen, Zone.explosionDamage(gen.LastDamage), explosionFunc)
-          gen.ClearHistory()
+          Zone.serverSideDamage(gen.Zone, gen, Zone.explosionDamage(gen.LastDamage), explosionFunc, Zone.findAllTargets)
 
         case GeneratorControl.Restored() =>
+          gen.ClearHistory()
           GeneratorControl.UpdateOwner(gen, Some(GeneratorControl.Event.Online))
 
         case _ => ;
@@ -153,7 +150,6 @@ class GeneratorControl(gen: Generator)
           imminentExplosion = false
           gen.Condition = PlanetSideGeneratorState.Destroyed
           GeneratorControl.UpdateOwner(gen, Some(GeneratorControl.Event.Destroyed))
-          gen.ClearHistory()
 
         case _ =>
       }
@@ -192,6 +188,10 @@ class GeneratorControl(gen: Generator)
     val newHealth = super.PerformRepairs(target, amount)
     if(newHealth == target.Definition.MaxHealth) {
       stopAutoRepair()
+    }
+    if(gen.Condition == PlanetSideGeneratorState.Critical && newHealth > (target.MaxHealth / 2)) {
+      gen.Condition = PlanetSideGeneratorState.Normal
+      GeneratorControl.UpdateOwner(gen, Some(GeneratorControl.Event.Normal))
     }
     newHealth
   }

@@ -5,8 +5,9 @@ import akka.actor.Props
 import akka.testkit.TestProbe
 import base.FreedContextActorTest
 import net.psforever.actors.zone.BuildingActor
+import net.psforever.actors.zone.building.{FacilityLogic, MajorFacilityLogic}
 import net.psforever.objects.avatar.Avatar
-import net.psforever.objects.ballistics.{Projectile, SourceEntry}
+import net.psforever.objects.ballistics.Projectile
 import net.psforever.objects.guid.NumberPoolHub
 import net.psforever.objects.guid.source.MaxNumberSource
 import net.psforever.objects.serverobject.CommonMessages
@@ -14,6 +15,7 @@ import net.psforever.objects.serverobject.deploy.Deployment
 import net.psforever.objects.serverobject.resourcesilo.{ResourceSilo, ResourceSiloControl}
 import net.psforever.objects.serverobject.structures.{AutoRepairStats, Building, StructureType}
 import net.psforever.objects.serverobject.terminals.{OrderTerminalDefinition, Terminal, TerminalControl}
+import net.psforever.objects.sourcing.SourceEntry
 import net.psforever.objects.vital.Vitality
 import net.psforever.objects.vital.base.DamageResolution
 import net.psforever.objects.vital.damage.DamageProfile
@@ -31,7 +33,7 @@ import scala.concurrent.duration._
 class AutoRepairFacilityIntegrationTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
   val avatarProbe = new TestProbe(system)
@@ -44,7 +46,7 @@ class AutoRepairFacilityIntegrationTest extends FreedContextActorTest {
     override def VehicleEvents = catchall
     override def Activity = catchall
   }
-  val building = Building.Structure(StructureType.Facility)(name = "integ-fac-test-building", guid = 6, map_id = 0, zone, context)
+  val building = Building.Structure(StructureType.Facility, Vector3.Zero, Vector3.Zero, GlobalDefinitions.building, MajorFacilityLogic)(name = "integ-fac-test-building", guid = 6, map_id = 0, zone, context)
   building.Invalidate()
 
   val player = Player(Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))
@@ -104,7 +106,7 @@ class AutoRepairFacilityIntegrationTest extends FreedContextActorTest {
 class AutoRepairFacilityIntegrationGiveNtuTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
   val avatarProbe = new TestProbe(system)
@@ -117,7 +119,7 @@ class AutoRepairFacilityIntegrationGiveNtuTest extends FreedContextActorTest {
     override def VehicleEvents = catchall
     override def Activity = catchall
   }
-  val building = Building.Structure(StructureType.Facility)(name = "integ-fac-test-building", guid = 6, map_id = 0, zone, context)
+  val building = Building.Structure(StructureType.Facility, Vector3.Zero, Vector3.Zero, GlobalDefinitions.building, MajorFacilityLogic)(name = "integ-fac-test-building", guid = 6, map_id = 0, zone, context)
   building.Invalidate()
 
   val terminal = new Terminal(AutoRepairIntegrationTest.terminal_definition)
@@ -159,7 +161,7 @@ class AutoRepairFacilityIntegrationGiveNtuTest extends FreedContextActorTest {
 class AutoRepairFacilityIntegrationAntGiveNtuTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   var buildingMap = new TrieMap[Int, Building]()
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
@@ -188,7 +190,7 @@ class AutoRepairFacilityIntegrationAntGiveNtuTest extends FreedContextActorTest 
     GlobalDefinitions.cryo_facility
   )
   buildingMap += 6 -> building
-  building.Actor = context.spawn(BuildingActor(zone, building), "integ-fac-test-building-control").toClassic
+  building.Actor = context.spawn(BuildingActor(zone, building, MajorFacilityLogic), "integ-fac-test-building-control").toClassic
   building.Invalidate()
 
   guid.register(player, number = 1)
@@ -250,7 +252,7 @@ class AutoRepairFacilityIntegrationAntGiveNtuTest extends FreedContextActorTest 
 class AutoRepairFacilityIntegrationTerminalDestroyedTerminalAntTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   var buildingMap = new TrieMap[Int, Building]()
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
@@ -280,7 +282,7 @@ class AutoRepairFacilityIntegrationTerminalDestroyedTerminalAntTest extends Free
     GlobalDefinitions.cryo_facility
   )
   buildingMap += 6 -> building
-  building.Actor = context.spawn(BuildingActor(zone, building), "integ-fac-test-building-control").toClassic
+  building.Actor = context.spawn(BuildingActor(zone, building, MajorFacilityLogic), "integ-fac-test-building-control").toClassic
   building.Invalidate()
 
   guid.register(player, number = 1)
@@ -352,7 +354,7 @@ class AutoRepairFacilityIntegrationTerminalDestroyedTerminalAntTest extends Free
 class AutoRepairFacilityIntegrationTerminalIncompleteRepairTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   var buildingMap = new TrieMap[Int, Building]()
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
@@ -382,7 +384,7 @@ class AutoRepairFacilityIntegrationTerminalIncompleteRepairTest extends FreedCon
     GlobalDefinitions.cryo_facility
   )
   buildingMap += 6 -> building
-  building.Actor = context.spawn(BuildingActor(zone, building), "integ-fac-test-building-control").toClassic
+  building.Actor = context.spawn(BuildingActor(zone, building, MajorFacilityLogic), "integ-fac-test-building-control").toClassic
   building.Invalidate()
 
   guid.register(player, number = 1)
@@ -468,7 +470,7 @@ class AutoRepairFacilityIntegrationTerminalIncompleteRepairTest extends FreedCon
 class AutoRepairTowerIntegrationTest extends FreedContextActorTest {
   import akka.actor.typed.scaladsl.adapter._
   system.spawn(InterstellarClusterService(Nil), InterstellarClusterService.InterstellarClusterServiceKey.id)
-  ServiceManager.boot(system) ! ServiceManager.Register(Props[GalaxyService](), "galaxy")
+  ServiceManager.boot(system) ! ServiceManager.Register(GalaxyService(), "galaxy")
   expectNoMessage(1000 milliseconds)
   val guid = new NumberPoolHub(new MaxNumberSource(max = 10))
   val avatarProbe = new TestProbe(system)
@@ -481,7 +483,7 @@ class AutoRepairTowerIntegrationTest extends FreedContextActorTest {
     override def VehicleEvents = catchall
     override def Activity = catchall
   }
-  val building = Building.Structure(StructureType.Tower)(name = "integ-twr-test-building", guid = 6, map_id = 0, zone, context)
+  val building = Building.Structure(StructureType.Facility, Vector3.Zero, Vector3.Zero, GlobalDefinitions.building, MajorFacilityLogic)(name = "integ-fac-test-building", guid = 6, map_id = 0, zone, context)
   building.Invalidate()
 
   val player = Player(Avatar(0, "TestCharacter", PlanetSideEmpire.TR, CharacterSex.Male, 0, CharacterVoice.Mute))

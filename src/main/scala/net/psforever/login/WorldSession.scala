@@ -3,18 +3,21 @@ package net.psforever.login
 import akka.actor.ActorRef
 import akka.pattern.{AskTimeoutException, ask}
 import akka.util.Timeout
-import net.psforever.objects.equipment.{Ammo, Equipment}
+import net.psforever.objects._
+import net.psforever.objects.equipment.{Ammo, Equipment, EquipmentSize}
 import net.psforever.objects.guid._
 import net.psforever.objects.inventory.{Container, InventoryItem}
 import net.psforever.objects.locker.LockerContainer
 import net.psforever.objects.serverobject.PlanetSideServerObject
-import net.psforever.objects.serverobject.containable.Containable
+import net.psforever.objects.serverobject.containable.{Containable, ContainableBehavior}
+import net.psforever.objects.serverobject.terminals.Terminal
+import net.psforever.objects.sourcing.AmenitySource
+import net.psforever.objects.vital.TerminalUsedActivity
 import net.psforever.objects.zones.Zone
-import net.psforever.objects._
-import net.psforever.packet.game.ObjectHeldMessage
-import net.psforever.types.{PlanetSideGUID, TransactionType, Vector3}
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.types.{ExoSuitType, PlanetSideGUID, TransactionType, Vector3}
+import net.psforever.services.avatar.AvatarAction
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.ObjectDelete
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
@@ -32,10 +35,11 @@ object WorldSession {
     * @return 1 for `true`; 0 for `false`
     */
   implicit def boolToInt(b: Boolean): Int = if (b) 1 else 0
-  private implicit val timeout            = new Timeout(5000 milliseconds)
+
+  private implicit val timeout: Timeout = new Timeout(5000 milliseconds)
 
   /**
-    * Use this for placing equipment that has yet to be registered into a container,
+    * Use this for placing equipment that has already been registered into a container,
     * such as in support of changing ammunition types in `Tool` objects (weapons).
     * If the object can not be placed into the container, it will be dropped onto the ground.
     * It will also be dropped if it takes too long to be placed.
@@ -62,7 +66,7 @@ object WorldSession {
           Zone.Ground.DropItem(localItem, localContainer.Position, Vector3.z(localContainer.Orientation.z)),
           localContainer.Actor
         )
-      case _ => ;
+      case _ => ()
     }
     result
   }
@@ -160,7 +164,7 @@ object WorldSession {
     result.onComplete {
       case Failure(_) | Success(_: Containable.CanNotPutItemInSlot) =>
         TaskWorkflow.execute(GUIDTask.unregisterEquipment(localContainer.Zone.GUID, localItem))
-      case _ => ;
+      case _ => ()
     }
     result
   }
@@ -186,7 +190,6 @@ object WorldSession {
     val localZone = obj.Zone
     TaskBundle(
       new StraightforwardTask() {
-        private val localContainer                             = obj
         private val localItem                                  = item
         private val localSlot                                  = slot
         private val localFunc: (Equipment, Int) => Future[Any] = PutEquipmentInInventorySlot(obj)
@@ -278,7 +281,7 @@ object WorldSession {
     * @throws `RuntimeException` if slot is not a player visible slot (holsters)
     * @see `ask`
     * @see `AvatarAction.ObjectDelete`
-    * @see `AvatarAction.SendResponse`
+    * @see `SendResponse`
     * @see `Containable.CanNotPutItemInSlot`
     * @see `Containable.PutItemInSlotOnly`
     * @see `GUIDTask.registerEquipment`
@@ -287,7 +290,7 @@ object WorldSession {
     * @see `ObjectHeldMessage`
     * @see `Player.DrawnSlot`
     * @see `Player.LastDrawnSlot`
-    * @see `Service.defaultPlayerGUID`
+    * @see `Default.GUID0`
     * @see `TaskBundle`
     * @see `Zone.AvatarEvents`
     * @param player the player whose visible slot will be equipped and drawn
@@ -299,46 +302,35 @@ object WorldSession {
     if (player.VisibleSlots.contains(slot)) {
       val localZone = player.Zone
       TaskBundle(
-        new StraightforwardTask() {
-          private val localPlayer   = player
-          private val localGUID     = player.GUID
-          private val localItem     = item
-          private val localSlot     = slot
-
-          def action(): Future[Any] = {
-            ask(localPlayer.Actor, Containable.PutItemInSlotOnly(localItem, localSlot))
-              .onComplete {
-                case Failure(_) | Success(_: Containable.CanNotPutItemInSlot) =>
-                  TaskWorkflow.execute(GUIDTask.unregisterEquipment(localZone.GUID, localItem))
-                case _ =>
-                  if (localPlayer.DrawnSlot != Player.HandsDownSlot) {
-                    localPlayer.DrawnSlot = Player.HandsDownSlot
-                    localZone.AvatarEvents ! AvatarServiceMessage(
-                      localPlayer.Name,
-                      AvatarAction.SendResponse(
-                        Service.defaultPlayerGUID,
-                        ObjectHeldMessage(localGUID, Player.HandsDownSlot, false)
-                      )
-                    )
-                    localZone.AvatarEvents ! AvatarServiceMessage(
-                      localZone.id,
-                      AvatarAction.ObjectHeld(localGUID, localPlayer.LastDrawnSlot)
-                    )
-                  }
-                  localPlayer.DrawnSlot = localSlot
-                  localZone.AvatarEvents ! AvatarServiceMessage(
-                    localZone.id,
-                    AvatarAction.SendResponse(Service.defaultPlayerGUID, ObjectHeldMessage(localGUID, localSlot, false))
-                  )
-              }
-            Future(this)
-          }
-        },
+        TaskToHoldEquipmentUp(player)(item, slot),
         GUIDTask.registerEquipment(localZone.GUID, item)
       )
     } else {
       //TODO log.error
       throw new RuntimeException(s"provided slot $slot is not a player visible slot (holsters)")
+    }
+  }
+
+  def TaskToHoldEquipmentUp(player: Player)(item: Equipment, slot: Int): Task = {
+    new StraightforwardTask() {
+      private val localPlayer = player
+      private val localGUID   = player.GUID
+      private val localItem   = item
+      private val localSlot   = slot
+      private val localZone   = player.Zone
+
+      def action(): Future[Any] = {
+        ask(localPlayer.Actor, Containable.PutItemInSlotOnly(localItem, localSlot))
+          .onComplete {
+            case Failure(_) | Success(_: Containable.CanNotPutItemInSlot) =>
+              TaskWorkflow.execute(GUIDTask.unregisterEquipment(localZone.GUID, localItem))
+            case _ =>
+              forcedTolowerRaisedArm(localPlayer, localPlayer.GUID, localZone)
+              localPlayer.DrawnSlot = localSlot
+              localZone.AvatarEvents ! MessageEnvelope(localZone.id, localGUID, AvatarAction.ObjectHeld(localSlot, localSlot))
+          }
+        Future(this)
+      }
     }
   }
 
@@ -367,17 +359,18 @@ object WorldSession {
     val future         = ask(localZone.Ground, Zone.Ground.PickupItem(item.GUID))
     future.onComplete {
       case Success(Zone.Ground.ItemInHand(_)) =>
-        PutEquipmentInInventoryOrDrop(localContainer)(localItem)
+        PutEquipmentInInventoryOrDrop(localContainer)(localItem).onComplete {
+          case Success(Containable.ItemPutInSlot(_, _, Player.FreeHandSlot, _)) =>
+            localContainer.Actor ! Zone.Ground.CanNotPickupItem(localZone, localItem.GUID, "@InventoryPickupNoRoom")
+          case _ => ()
+        }
       case Success(Zone.Ground.CanNotPickupItem(_, item_guid, _)) =>
         localZone.GUID(item_guid) match {
-          case Some(_) => ;
+          case Some(_) => ()
           case None => //acting on old data?
-            localZone.AvatarEvents ! AvatarServiceMessage(
-              localZone.id,
-              AvatarAction.ObjectDelete(Service.defaultPlayerGUID, item_guid)
-            )
+            localZone.AvatarEvents ! MessageEnvelope(localZone.id, ObjectDelete(item_guid))
         }
-      case _ => ;
+      case _ => ()
     }
     future
   }
@@ -413,7 +406,7 @@ object WorldSession {
             .DropItem(localItem, localPos.getOrElse(localContainer.Position), Vector3.z(localContainer.Orientation.z)),
           localContainer.Actor
         )
-      case _ => ;
+      case _ => ()
     }
     result
   }
@@ -534,7 +527,6 @@ object WorldSession {
     * Failure of this process is not supported and may lead to irregular behavior.
     * @see `ActorRef`
     * @see `AvatarAction.ObjectDelete`
-    * @see `AvatarServiceMessage`
     * @see `Containable.MoveItem`
     * @see `Container`
     * @see `Equipment`
@@ -565,10 +557,12 @@ object WorldSession {
       val tile = item.Definition.Tile
       destination.Inventory.CheckCollisionsVar(dest, tile.Width, tile.Height)
     } match {
-      case Success(Nil) =>
+      case Success(Nil)
+        if ContainableBehavior.PermitEquipmentStow(destination, item, dest) =>
         //no swap item
         (true, None)
-      case Success(List(swapEntry: InventoryItem)) =>
+      case Success(List(swapEntry: InventoryItem))
+        if ContainableBehavior.PermitEquipmentStow(destination, item, dest) =>
         //the swap item is to be registered to the source's zone
         (true, Some(swapEntry.obj.GUID))
       case _ =>
@@ -577,18 +571,18 @@ object WorldSession {
     }
     if (performSwap) {
       def moveItemTaskFunc(toSlot: Int): Task = new StraightforwardTask() {
-        val localGUID = swapItemGUID //the swap item's original GUID, if any swap item
-        val localChannel = toChannel
-        val localSource = source
-        val localDestination = destination
-        val localItem = item
-        val localDestSlot = dest
-        val localSrcSlot = toSlot
+        val localGUID: Option[PlanetSideGUID] = swapItemGUID //the swap item's original GUID, if any swap item
+        val localChannel: String = toChannel
+        val localSource: PlanetSideServerObject with Container = source
+        val localDestination: PlanetSideServerObject with Container = destination
+        val localItem: Equipment = item
+        val localDestSlot: Int = dest
+        val localSrcSlot: Int = toSlot
         val localMoveOnComplete: Try[Any] => Unit = {
           case Success(Containable.ItemPutInSlot(_, _, _, Some(swapItem))) =>
             //swapItem is not registered right now, we can not drop the item without re-registering it
             TaskWorkflow.execute(PutNewEquipmentInInventorySlot(localSource)(swapItem, localSrcSlot))
-          case _ => ;
+          case _ => ()
         }
 
         override def description(): String = s"unregistering $localItem before stowing in $localDestination"
@@ -597,11 +591,8 @@ object WorldSession {
           localGUID match {
             case Some(guid) =>
               //see LockerContainerControl.RemoveItemFromSlotCallback
-              localSource.Zone.AvatarEvents ! AvatarServiceMessage(
-                localChannel,
-                AvatarAction.ObjectDelete(Service.defaultPlayerGUID, guid)
-              )
-            case None => ;
+              localSource.Zone.AvatarEvents ! MessageEnvelope(localChannel, ObjectDelete(guid))
+            case None => ()
           }
           val moveResult = ask(localDestination.Actor, Containable.PutItemInSlotOrAway(localItem, Some(localDestSlot)))
           moveResult.onComplete(localMoveOnComplete)
@@ -614,7 +605,7 @@ object WorldSession {
             moveItemTaskFunc(fromSlot),
             GUIDTask.unregisterEquipment(fromSource.Zone.GUID, itemToMove)
           ))
-        case _ => ;
+        case _ => ()
       }
       val result = ask(source.Actor, Containable.RemoveItemFromSlot(item))
       result.onComplete(resultOnComplete)
@@ -625,8 +616,7 @@ object WorldSession {
     * Remove an item from a player's locker inventory.
     * Failure of this process is not supported and may lead to irregular behavior.
     * @see `ActorRef`
-    * @see `AvatarAction.ObjectDelete`
-    * @see `AvatarServiceMessage`
+    * @see `ObjectDelete`
     * @see `Containable.MoveItem`
     * @see `Container`
     * @see `Equipment`
@@ -653,39 +643,256 @@ object WorldSession {
                                           item: Equipment,
                                           dest: Int
                                         ): Unit = {
-    TaskWorkflow.execute(TaskBundle(
-      new StraightforwardTask() {
-        val localGUID        = item.GUID //original GUID
-        val localChannel     = toChannel
-        val localSource      = source
-        val localDestination = destination
-        val localItem        = item
-        val localSlot        = dest
-        /*
-        source is a locker container that has its own internal unique number system
-        the item is currently registered to this system
-        the item will be moved into the system in which the destination operates
-        to facilitate the transfer, the item needs to be partially unregistered from the source's system
-        to facilitate the transfer, the item needs to be preemptively registered to the destination's system
-        invalidating the current unique number is sufficient for both of these steps
-         */
-        localItem.Invalidate()
-        localItem match {
-          case t: Tool => t.AmmoSlots.foreach { _.Box.Invalidate() }
-          case _       => ;
+    val (performSwap, swapItemGUID): (Boolean, Option[PlanetSideGUID]) = {
+      val destInv = destination.Inventory
+      if (destInv.Offset <= dest && destInv.Offset + destInv.TotalCapacity >= dest) {
+        val tile = item.Definition.Tile
+        destInv.CheckCollisionsVar(dest, tile.Width, tile.Height)
+      } else {
+        val slot = destination.Slot(dest)
+        if (slot.Size != EquipmentSize.Blocked) {
+          slot.Equipment match {
+            case Some(thing) => Success(List(InventoryItem(thing, dest)))
+            case None        => Success(Nil)
+          }
+        } else {
+          Failure(new Exception(""))
+        }
+      }
+    } match {
+      case Success(Nil) =>
+        //no swap item
+        (true, None)
+      case Success(List(swapEntry: InventoryItem)) =>
+        //the swap item is to be registered to the source's zone
+        (true, Some(swapEntry.obj.GUID))
+      case _ =>
+        //too many swap items or other error; this attempt will not execute
+        (false, None)
+    }
+    if (performSwap) {
+      def moveItemTaskFunc(toSlot: Int): Task = new StraightforwardTask() {
+        val localGUID: Option[PlanetSideGUID] = swapItemGUID //the swap item's original GUID, if any swap item
+        val localChannel: String = toChannel
+        val localSource: PlanetSideServerObject with Container = source
+        val localDestination: PlanetSideServerObject with Container = destination
+        val localItem: Equipment = item
+        val localDestSlot: Int = dest
+        val localSrcSlot: Int = toSlot
+        val localMoveOnComplete: Try[Any] => Unit = {
+          case Success(Containable.ItemPutInSlot(_, _, _, Some(swapItem))) =>
+            //swapItem is not registered right now, we can not drop the item without re-registering it
+            TaskWorkflow.execute(PutNewEquipmentInInventorySlot(localSource)(swapItem, localSrcSlot))
+          case _ => ()
         }
 
         override def description(): String = s"registering $localItem in ${localDestination.Zone.id} before removing from $localSource"
 
         def action(): Future[Any] = {
-          val zone = localSource.Zone
-          //see LockerContainerControl.RemoveItemFromSlotCallback
-          zone.AvatarEvents ! AvatarServiceMessage(localChannel, AvatarAction.ObjectDelete(Service.defaultPlayerGUID, localGUID))
-          ask(localSource.Actor, Containable.MoveItem(localDestination, localItem, localSlot))
+          localGUID match {
+            case Some(guid) =>
+              //see LockerContainerControl.RemoveItemFromSlotCallback
+              localSource.Zone.AvatarEvents ! MessageEnvelope(localChannel, ObjectDelete(guid))
+            case None => ()
+          }
+          val moveResult = ask(localDestination.Actor, Containable.PutItemInSlotOrAway(localItem, Some(localDestSlot)))
+          moveResult.onComplete(localMoveOnComplete)
+          moveResult
         }
-      },
-      GUIDTask.registerEquipment(destination.Zone.GUID, item))
-    )
+      }
+      val resultOnComplete: Try[Any] => Unit = {
+        case Success(Containable.ItemFromSlot(fromSource, Some(itemToMove), Some(fromSlot))) =>
+          TaskWorkflow.execute(TaskBundle(
+            moveItemTaskFunc(fromSlot),
+            GUIDTask.registerEquipment(fromSource.Zone.GUID, itemToMove)
+          ))
+        case _ => ()
+      }
+      val result = ask(source.Actor, Containable.RemoveItemFromSlot(item))
+      result.onComplete(resultOnComplete)
+    }
+  }
+
+  /**
+   * Quickly draw a grenade from anywhere on the player's person and place it into a certain hand
+   * at the ready to be used as a weapon.
+   * Soldiers in mechanized assault exo-suits can not perform this action.<br>
+   * <br>
+   * This is not vanilla behavior.<br>
+   * <br>
+   * Search for a grenade of either fragmentation- or plasma-type in the hands (holsters) or backpack (inventory)
+   * and bring it to hand and draw that grenade as a weapon as quickly as possible.
+   * If the player has a weapon already drawn, remove it from his active hand quickly.
+   * It may be placed back into the slot once the hand is / will be occupied by a grenade.
+   * For anything in the first sidearm weapon slot, where the grenade will be placed,
+   * either find room in the backpack for it or drop it on the ground.
+   * If the player's already-drawn hand is the same as the one that will hold the grenade (first sidearm holster),
+   * treat it like the sidearm occupier rather than the already-drawn weapon -
+   * the old weapon goes into the backpack or onto the ground.
+   * @see `ObjectHeld`
+   * @see `Containable.RemoveItemFromSlot`
+   * @see `countRestrictAttempts`
+   * @see `forcedTolowerRaisedArm`
+   * @see `GlobalDefinitions.isGrenade`
+   * @see `InventoryItem`
+   * @see `Player.DrawnSlot`
+   * @see `Player.HandsDownSlot`
+   * @see `Player.Holsters`
+   * @see `Player.ResistArmMotion`
+   * @see `Player.Slot`
+   * @see `PutEquipmentInInventoryOrDrop`
+   * @see `PutEquipmentInInventorySlot`
+   * @see `TaskBundle`
+   * @see `TaskToHoldEquipmentUp`
+   * @see `TaskWorkflow.execute`
+   * @param tplayer player who wants to draw a grenade
+   * @param equipSlot slot being used as the final destination for any discovered grenade
+   * @param log reference to the messaging protocol
+   * @return if there was a discovered grenade
+   */
+  def QuickSwapToAGrenade(
+                           tplayer: Player,
+                           equipSlot: Int,
+                           log: org.log4s.Logger): Boolean = {
+    if (tplayer.ExoSuit != ExoSuitType.MAX) {
+      val previouslyDrawnSlot = tplayer.DrawnSlot
+      val optGrenadeInSlot = {
+        tplayer.Holsters().zipWithIndex.find { case (slot, _) =>
+          slot.Equipment match {
+            case Some(equipment) =>
+              val definition = equipment.Definition
+              val name = definition.Name
+              GlobalDefinitions.isGrenade(definition) && (name.contains("frag") || name.contains("plasma"))
+            case _ =>
+              false
+          }
+        } match {
+          case Some((_, slotNum)) if slotNum == previouslyDrawnSlot =>
+            //grenade already in hand; do nothing
+            None
+          case Some((grenadeSlot, slotNum)) =>
+            //grenade is holstered in some other slot; just extend it (or swap hands)
+            val guid = tplayer.GUID
+            val zone = tplayer.Zone
+            val grenade = grenadeSlot.Equipment.get
+            val drawnSlotItem = tplayer.Slot(tplayer.DrawnSlot).Equipment
+            if (forcedTolowerRaisedArm(tplayer, guid, zone)) {
+              log.info(s"${tplayer.Name} has dropped ${tplayer.Sex.possessive} ${drawnSlotItem.get.Definition.Name}")
+            }
+            //put up hand with grenade in it
+            tplayer.DrawnSlot = slotNum
+            zone.AvatarEvents ! MessageEnvelope(zone.id, guid, AvatarAction.ObjectHeld(slotNum, slotNum))
+            log.info(s"${tplayer.Name} has quickly drawn a ${grenade.Definition.Name}")
+            None
+          case None =>
+            //check inventory for a grenade
+            tplayer.Inventory.Items.find { case InventoryItem(equipment, _) =>
+              val definition = equipment.Definition
+              val name = definition.Name
+              GlobalDefinitions.isGrenade(definition) && (name.contains("frag") || name.contains("plasma"))
+            } match {
+              case Some(InventoryItem(equipment, slotNum)) => Some(equipment.asInstanceOf[Tool], slotNum)
+              case _                                       => None
+            }
+        }
+      }
+      optGrenadeInSlot match {
+        case Some((grenade, slotNum)) =>
+          val itemInPreviouslyDrawnSlotToDrop = if (equipSlot != previouslyDrawnSlot) {
+            forcedTolowerRaisedArm(tplayer, tplayer.GUID, tplayer.Zone)
+            tplayer.Slot(previouslyDrawnSlot).Equipment match {
+              case out @ Some(_) =>
+                tplayer.ResistArmMotion(countRestrictAttempts(count=1))
+                out
+              case _ =>
+                None
+            }
+          } else {
+            None
+          }
+          val itemPreviouslyInPistolSlot = tplayer.Slot(equipSlot).Equipment
+          val result = for {
+            //remove grenade from inventory
+            a <- ask(tplayer.Actor, Containable.RemoveItemFromSlot(slotNum))
+            //remove equipment from pistol slot, where grenade will go
+            b <- itemPreviouslyInPistolSlot match {
+              case Some(_) => ask(tplayer.Actor, Containable.RemoveItemFromSlot(equipSlot))
+              case _       => Future(true)
+            }
+            //remove held equipment (if any)
+            c <- itemInPreviouslyDrawnSlotToDrop match {
+              case Some(_) => ask(tplayer.Actor, Containable.RemoveItemFromSlot(previouslyDrawnSlot))
+              case _       => Future(false)
+            }
+          } yield (a, b, c)
+          result.onComplete {
+            case Success((_, _, _)) =>
+              //put equipment in hand and hold grenade up
+              TaskWorkflow.execute(TaskBundle(TaskToHoldEquipmentUp(tplayer)(grenade, equipSlot)))
+              //what to do with the equipment that was removed for the grenade
+              itemPreviouslyInPistolSlot match {
+                case Some(e) =>
+                  log.info(s"${tplayer.Name} has dropped ${tplayer.Sex.possessive} ${e.Definition.Name}")
+                  PutEquipmentInInventoryOrDrop(tplayer)(e)
+                case _ => ()
+              }
+              //restore previously-held-up equipment
+              itemInPreviouslyDrawnSlotToDrop match {
+                case Some(e) => PutEquipmentInInventorySlot(tplayer)(e, previouslyDrawnSlot)
+                case _ => ()
+              }
+              log.info(s"${tplayer.Name} has quickly drawn a ${grenade.Definition.Name}")
+            case _ => ()
+          }
+        case None => ()
+      }
+      optGrenadeInSlot.nonEmpty
+    } else {
+      false
+    }
+  }
+
+  /**
+   * If the player has a raised arm, lower it.
+   * Do it manually, bypassing the checks in the normal procedure.
+   * @see `ObjectHeld`
+   * @see `Player.DrawnSlot`
+   * @see `Player.HandsDownSlot`
+   * @param tplayer the player
+   * @param guid target guid (usually the player)
+   * @param zone the zone of reporting
+   * @return if the hand has a drawn equipment in it and tries to lower
+   */
+  private def forcedTolowerRaisedArm(tplayer: Player, guid:PlanetSideGUID, zone: Zone): Boolean = {
+    val slot = tplayer.DrawnSlot
+    if (slot != Player.HandsDownSlot) {
+      tplayer.DrawnSlot = Player.HandsDownSlot
+      zone.AvatarEvents ! MessageEnvelope(zone.id, guid, AvatarAction.ObjectHeld(Player.HandsDownSlot, slot))
+      true
+    } else {
+      false
+    }
+  }
+
+  /**
+   * Restriction logic that stops the player
+   * from lowering or raising any drawn equipment a certain number of times.
+   * Reset to default restriction behavior when no longer valid.
+   * @see `Player.neverRestrict`
+   * @see `Player.ResistArmMotion`
+   * @param count number of times to stop the player from adjusting their arm
+   * @param player target player
+   * @param slot slot being switched to (unused here)
+   * @return if the motion is restricted
+   */
+  def countRestrictAttempts(count: Int)(player: Player, slot: Int): Boolean = {
+    if (count > 0) {
+      player.ResistArmMotion(countRestrictAttempts(count - 1))
+      true
+    } else {
+      player.ResistArmMotion(Player.neverRestrict) //reset
+      false
+    }
   }
 
   /**
@@ -717,7 +924,13 @@ object WorldSession {
   def TerminalResult(guid: PlanetSideGUID, player: Player, transaction: TransactionType.Value)(
       result: Boolean
   ): Unit = {
-    player.Zone.AvatarEvents ! AvatarServiceMessage(
+    if (result) {
+      player.Zone.GUID(guid).collect { case term: Terminal =>
+        player.LogActivity(TerminalUsedActivity(AmenitySource(term), transaction))
+        player.ContributionFrom(term)
+      }
+    }
+    player.Zone.AvatarEvents ! MessageEnvelope(
       player.Name,
       AvatarAction.TerminalOrderResult(guid, transaction, result)
     )
@@ -730,7 +943,7 @@ object WorldSession {
     * @param container the original object that contained the items
     * @param drops the items to be dropped on the ground
     */
-  def DropLeftovers(container: PlanetSideServerObject with Container)(drops: List[InventoryItem]): Unit = {
+  def DropLeftovers(container: PlanetSideServerObject with Container)(drops: Iterable[InventoryItem]): Unit = {
     //drop or retire
     val zone   = container.Zone
     val pos    = container.Position
@@ -833,6 +1046,13 @@ object WorldSession {
     }
   }
 
+  /**
+   * Perform a task and, upon completion, dispatch a message.
+   * @param task task to be completed first
+   * @param sendTo where to send the message
+   * @param pass message
+   * @return a `TaskBundle` object
+   */
   def CallBackForTask(task: TaskBundle, sendTo: ActorRef, pass: Any): TaskBundle = {
     TaskBundle(
       new StraightforwardTask() {
@@ -844,6 +1064,32 @@ object WorldSession {
 
         def action() : Future[Any] = {
           destination ! passMsg
+          Future(this)
+        }
+      },
+      task
+    )
+  }
+
+  /**
+   * Perform a task and, upon completion, dispatch a message whose origin is specific and different from normal.
+   * @param task task to be completed first
+   * @param sendTo where to send the message
+   * @param pass message
+   * @param replyTo whom to attribute the message being passed (e.g., `tell`)
+   * @return a `TaskBundle` object
+   */
+  def CallBackForTask(task: TaskBundle, sendTo: ActorRef, pass: Any, replyTo: ActorRef): TaskBundle = {
+    TaskBundle(
+      new StraightforwardTask() {
+        private val localDesc   = task.description()
+        private val destination = sendTo
+        private val passMsg     = pass
+
+        override def description(): String = s"callback for tasking $localDesc"
+
+        def action() : Future[Any] = {
+          destination.tell(passMsg, replyTo)
           Future(this)
         }
       },

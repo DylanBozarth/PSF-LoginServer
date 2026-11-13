@@ -2,7 +2,7 @@ package net.psforever.objects
 
 import net.psforever.objects.avatar.Avatar
 import net.psforever.objects.zones.{Zone, Zoning}
-import net.psforever.packet.game.DeadState
+import net.psforever.packet.game.packets.DeadState
 
 case class Session(
     id: Long = 0,
@@ -10,8 +10,12 @@ case class Session(
     account: Account = null,
     player: Player = null,
     avatar: Avatar = null,
-    zoningType: Zoning.Method.Value = Zoning.Method.None,
+    zoningType: Zoning.Method = Zoning.Method.None,
     deadState: DeadState.Value = DeadState.Alive,
     speed: Float = 1.0f,
     flying: Boolean = false
 )
+
+trait SessionSource {
+  def session: Session
+}

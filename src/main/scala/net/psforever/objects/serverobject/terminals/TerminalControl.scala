@@ -2,7 +2,7 @@
 package net.psforever.objects.serverobject.terminals
 
 import akka.actor.ActorRef
-import net.psforever.objects.{GlobalDefinitions, SimpleItem}
+import net.psforever.objects.{GlobalDefinitions, SimpleItem, Tool}
 import net.psforever.objects.serverobject.CommonMessages
 import net.psforever.objects.serverobject.affinity.FactionAffinityBehavior
 import net.psforever.objects.serverobject.damage.Damageable.Target
@@ -11,32 +11,32 @@ import net.psforever.objects.serverobject.hackable.{GenericHackables, HackableBe
 import net.psforever.objects.serverobject.repair.{AmenityAutoRepair, RepairableAmenity}
 import net.psforever.objects.serverobject.structures.{Building, PoweredAmenityControl}
 import net.psforever.objects.vital.interaction.DamageResult
-import net.psforever.services.Service
-import net.psforever.services.local.{LocalAction, LocalServiceMessage}
+import net.psforever.packet.game.packets.HackState1
+import net.psforever.services.local.support.{HackClearActor, HackClearEnvelope}
 
 /**
   * An `Actor` that handles messages being dispatched to a specific `Terminal`.
   * @param term the `Terminal` object being governed
   */
 class TerminalControl(term: Terminal)
-    extends PoweredAmenityControl
+  extends PoweredAmenityControl
     with FactionAffinityBehavior.Check
     with HackableBehavior.GenericHackable
     with DamageableAmenity
     with RepairableAmenity
     with AmenityAutoRepair {
-  def FactionObject    = term
-  def HackableObject   = term
-  def DamageableObject = term
-  def RepairableObject = term
-  def AutoRepairObject = term
+  def FactionObject: Terminal    = term
+  def HackableObject: Terminal   = term
+  def DamageableObject: Terminal = term
+  def RepairableObject: Terminal = term
+  def AutoRepairObject: Terminal = term
 
   val commonBehavior: Receive = checkBehavior
     .orElse(takesDamage)
     .orElse(canBeRepairedByNanoDispenser)
     .orElse(autoRepairBehavior)
 
-  def poweredStateLogic : Receive =
+  def poweredStateLogic: Receive =
     commonBehavior
       .orElse(hackableBehavior)
       .orElse {
@@ -48,23 +48,46 @@ class TerminalControl(term: Terminal)
           //TODO setup certifications check
           term.Owner match {
             case b: Building if (b.Faction != player.Faction || b.CaptureTerminalIsHacked) && term.HackedBy.isEmpty =>
+              //order terminals are 90 / 1, or 60 / ?
               sender() ! CommonMessages.Progress(
                 GenericHackables.GetHackSpeed(player, term),
-                GenericHackables.FinishHacking(term, player, 3212836864L),
-                GenericHackables.HackingTickAction(progressType = 1, player, term, item.GUID)
+                GenericHackables.FinishHacking(term, player, hackValue = -1, hackClearValue = -1),
+                GenericHackables.HackingTickAction(HackState1.Unk1, player, term, item.GUID)
               )
-            case _ => ;
+            case _ => ()
           }
-
-        case _ => ;
+        case CommonMessages.UploadVirus(player, Some(item: Tool), virus)
+          if item.Definition == GlobalDefinitions.trek =>
+          term.Owner match {
+            case _: Building =>
+              sender() ! CommonMessages.Progress(
+                1.66f,
+                GenericHackables.FinishVirusAction(term, player, hackValue = -1, hackClearValue = -1, virus),
+                GenericHackables.HackingTickAction(HackState1.Unk1, player, term, item.GUID)
+              )
+            case _ => ()
+          }
+        case CommonMessages.RemoveVirus(player, Some(item: SimpleItem))
+          if item.Definition == GlobalDefinitions.remote_electronics_kit =>
+          term.Owner match {
+            case _: Building =>
+              sender() ! CommonMessages.Progress(
+                1.66f,
+                GenericHackables.FinishVirusAction(term, player, hackValue = -1, hackClearValue = -1, virus=8L),
+                GenericHackables.HackingTickAction(HackState1.Unk1, player, term, item.GUID)
+              )
+            case _ => ()
+          }
+        case _ => ()
       }
 
   def unpoweredStateLogic : Receive = commonBehavior
+    .orElse(clearHackBehavior)
     .orElse {
       case Terminal.Request(player, msg) =>
         sender() ! Terminal.TerminalMessage(player, msg, Terminal.NoDeal())
 
-      case _ => ;
+      case _ => ()
     }
 
   override protected def DamageAwareness(target: Target, cause: DamageResult, amount: Any) : Unit = {
@@ -76,7 +99,7 @@ class TerminalControl(term: Terminal)
     tryAutoRepair()
     if (term.HackedBy.nonEmpty) {
       val zone = term.Zone
-      zone.LocalEvents ! LocalServiceMessage(zone.id, LocalAction.ClearTemporaryHack(Service.defaultPlayerGUID, term))
+      zone.LocalEvents ! HackClearEnvelope(HackClearActor.ObjectIsResecured(term))
     }
     super.DestructionAwareness(target, cause)
   }
@@ -98,7 +121,7 @@ class TerminalControl(term: Terminal)
     //clear hack state
     if (term.HackedBy.nonEmpty) {
       val zone = term.Zone
-      zone.LocalEvents ! LocalServiceMessage(zone.id, LocalAction.ClearTemporaryHack(Service.defaultPlayerGUID, term))
+      zone.LocalEvents ! HackClearEnvelope(HackClearActor.ObjectIsResecured(term))
     }
   }
 

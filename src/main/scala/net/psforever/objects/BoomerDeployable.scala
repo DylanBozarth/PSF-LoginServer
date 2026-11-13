@@ -2,16 +2,21 @@
 package net.psforever.objects
 
 import akka.actor.{ActorContext, Props}
-import net.psforever.objects.ballistics.{PlayerSource, SourceEntry}
 import net.psforever.objects.ce.{Deployable, DeployedItem}
 import net.psforever.objects.guid.{GUIDTask, TaskWorkflow}
+import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.{CommonMessages, PlanetSideServerObject}
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
+import net.psforever.objects.vital.Vitality
 import net.psforever.objects.vital.etc.TriggerUsedReason
 import net.psforever.objects.vital.interaction.DamageInteraction
 import net.psforever.objects.zones.Zone
-import net.psforever.services.Service
-import net.psforever.services.avatar.{AvatarAction, AvatarServiceMessage}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.ObjectDelete
+import net.psforever.services.local.LocalAction
 import net.psforever.types.PlanetSideEmpire
+
+import scala.annotation.unused
 
 class BoomerDeployable(cdef: ExplosiveDeployableDefinition)
   extends ExplosiveDeployable(cdef) {
@@ -34,8 +39,9 @@ class BoomerDeployable(cdef: ExplosiveDeployableDefinition)
   }
 }
 
-class BoomerDeployableDefinition(private val objectId: Int) extends ExplosiveDeployableDefinition(objectId) {
-  override def Initialize(obj: Deployable, context: ActorContext) = {
+class BoomerDeployableDefinition(private val objectId: Int)
+  extends ExplosiveDeployableDefinition(objectId) {
+  override def Initialize(obj: Deployable, context: ActorContext): Unit = {
     obj.Actor =
       context.actorOf(Props(classOf[BoomerDeployableControl], obj), PlanetSideServerObject.UniqueActorName(obj))
   }
@@ -56,8 +62,7 @@ class BoomerDeployableControl(mine: BoomerDeployable)
         case CommonMessages.Use(player, Some(trigger: BoomerTrigger)) if mine.Trigger.contains(trigger) =>
           // the trigger damages the mine, which sets it off, which causes an explosion
           // think of this as an initiator to the proper explosion
-          mine.Destroyed = true
-          ExplosiveDeployableControl.DamageResolution(
+          HandleDamage(
             mine,
             DamageInteraction(
               SourceEntry(mine),
@@ -66,18 +71,25 @@ class BoomerDeployableControl(mine: BoomerDeployable)
             ).calculate()(mine),
             damage = 0
           )
-
-        case _ => ;
+        case _ => ()
       }
 
-  override def loseOwnership(faction: PlanetSideEmpire.Value): Unit = {
-    super.loseOwnership(PlanetSideEmpire.NEUTRAL)
-    mine.OwnerName = None
+  def loseOwnership(@unused faction: PlanetSideEmpire.Value): Unit = {
+    super.loseOwnership(mine, PlanetSideEmpire.NEUTRAL)
+    val guid = mine.OwnerGuid
+    mine.AssignOwnership(None)
+    mine.OwnerGuid = guid
   }
 
   override def gainOwnership(player: Player): Unit = {
-    mine.Faction = PlanetSideEmpire.NEUTRAL //force map icon redraw
+    val originalOwner = mine.OwnerName
     super.gainOwnership(player, player.Faction)
+    val events = mine.Zone.LocalEvents
+    val msg = LocalAction.DeployItem(mine)
+    originalOwner.collect { name =>
+      events ! MessageEnvelope(name, msg)
+    }
+    events ! MessageEnvelope(player.Name, msg)
   }
 
   override def dismissDeployable() : Unit = {
@@ -93,14 +105,24 @@ class BoomerDeployableControl(mine: BoomerDeployable)
             container.Slot(index).Equipment = None
           case Some(Zone.EquipmentIs.OnGround()) =>
             zone.Ground ! Zone.Ground.RemoveItem(guid)
-          case _ => ;
+          case _ => ()
         }
-        zone.AvatarEvents! AvatarServiceMessage(
-          zone.id,
-          AvatarAction.ObjectDelete(Service.defaultPlayerGUID, trigger.GUID)
-        )
+        zone.AvatarEvents! MessageEnvelope(zone.id, ObjectDelete(guid))
         TaskWorkflow.execute(GUIDTask.unregisterObject(zone.GUID, trigger))
-      case None => ;
+      case None => ()
     }
+  }
+
+  /**
+   * Boomers are not bothered by explosive sympathy
+   * but can still be affected by sources of jammering.
+   * @param obj the entity being damaged
+   * @param damage the amount of damage
+   * @param data historical information about the damage
+   *  @return `true`, if the target can be affected;
+   *        `false`, otherwise
+   */
+  override def CanDetonate(obj: Vitality with FactionAffinity, damage: Int, data: DamageInteraction): Boolean = {
+    super.CanDetonate(obj, damage, data) || data.cause.isInstanceOf[TriggerUsedReason]
   }
 }

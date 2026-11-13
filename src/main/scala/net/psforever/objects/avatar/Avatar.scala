@@ -1,15 +1,18 @@
+// Copyright (c) 2017 PSForever
 package net.psforever.objects.avatar
 
+import net.psforever.actors.session.AvatarActor
+import net.psforever.objects.avatar.scoring.ScoreCard
 import net.psforever.objects.definition.{AvatarDefinition, BasicDefinition}
 import net.psforever.objects.equipment.{EquipmentSize, EquipmentSlot}
 import net.psforever.objects.inventory.LocallyRegisteredInventory
 import net.psforever.objects.loadouts.{Loadout, SquadLoadout}
 import net.psforever.objects.locker.{LockerContainer, LockerEquipment}
 import net.psforever.objects.{GlobalDefinitions, OffhandEquipmentSlot}
+import net.psforever.packet.game.objectcreate.{BasicCharacterData, RibbonBars}
 import net.psforever.types._
 import org.joda.time.{Duration, LocalDateTime, Seconds}
 
-import scala.collection.immutable.Seq
 import scala.concurrent.duration._
 
 object Avatar {
@@ -65,12 +68,23 @@ object Avatar {
     GlobalDefinitions.trhev_pounder         -> 5.minutes
   )
 
+  val cudCooldowns: Map[String, FiniteDuration] = Map(
+  "orbital_strike"                        -> 3.hours,
+  "emp_blast"                             -> 20.minutes,
+  "reveal_friendlies"                     -> 20.minutes,
+  "reveal_enemies"                        -> 20.minutes
+  )
+
   val useCooldowns: Map[BasicDefinition, FiniteDuration] = Map(
     GlobalDefinitions.medkit           -> 5.seconds,
     GlobalDefinitions.super_armorkit   -> 20.minutes,
     GlobalDefinitions.super_medkit     -> 20.minutes,
     GlobalDefinitions.super_staminakit -> 5.minutes // Temporary - Default value is 20 minutes
   )
+
+  def apply(charId: Int, name: String, faction: PlanetSideEmpire.Value, sex: CharacterSex, head: Int, voice: CharacterVoice.Value): Avatar = {
+    Avatar(charId, BasicCharacterData(name, faction, sex, head, voice))
+  }
 
   def makeLocker(): LockerContainer = {
     new LockerContainer({
@@ -81,36 +95,59 @@ object Avatar {
   }
 }
 
+case class Cooldowns(
+                      /** Timestamps of when a vehicle or equipment was last purchased */
+                      purchase: Map[String, LocalDateTime] = Map(),
+                      /** Timestamps of when a vehicle or equipment was last purchased */
+                      use: Map[String, LocalDateTime] = Map()
+                    )
+
+case class Loadouts(
+                     suit: Seq[Option[Loadout]] = Seq.fill(20)(None),
+                     squad: Seq[Option[SquadLoadout]] = Seq.fill(10)(None)
+                   )
+
+case class ProgressDecoration(
+                               cosmetics: Option[Set[Cosmetic]] = None,
+                               ribbonBars: RibbonBars = RibbonBars(),
+                               firstTimeEvents: Set[String] =
+                               FirstTimeEvents.Maps ++ FirstTimeEvents.Monoliths ++
+                                 FirstTimeEvents.Standard.All ++ FirstTimeEvents.Cavern.All ++
+                                 FirstTimeEvents.TR.All ++ FirstTimeEvents.NC.All ++ FirstTimeEvents.VS.All ++
+                                 FirstTimeEvents.Generic
+                             )
+
+case class MemberLists(
+                        friend: List[Friend] = List[Friend](),
+                        ignored: List[Ignored] = List[Ignored]()
+                      )
+
+case class ModePermissions(
+                            canSpectate: Boolean = false,
+                            canGM: Boolean = false
+                          )
+
 case class Avatar(
     /** unique identifier corresponding to a database table row index */
     id: Int,
-    name: String,
-    faction: PlanetSideEmpire.Value,
-    sex: CharacterSex,
-    head: Int,
-    voice: CharacterVoice.Value,
+    basic: BasicCharacterData,
     bep: Long = 0,
     cep: Long = 0,
     stamina: Int = 100,
     fatigued: Boolean = false,
-    cosmetics: Option[Set[Cosmetic]] = None,
     certifications: Set[Certification] = Set(),
-    loadouts: Seq[Option[Loadout]] = Seq.fill(20)(None),
-    squadLoadouts: Seq[Option[SquadLoadout]] = Seq.fill(10)(None),
     implants: Seq[Option[Implant]] = Seq(None, None, None),
+    shortcuts: Array[Option[Shortcut]] = Array.fill[Option[Shortcut]](64)(None),
     locker: LockerContainer = Avatar.makeLocker(),
-    deployables: DeployableToolbox = new DeployableToolbox(), // TODO var bad
+    deployables: DeployableToolbox = new DeployableToolbox(),
     lookingForSquad: Boolean = false,
     var vehicle: Option[PlanetSideGUID] = None, // TODO var bad
-    firstTimeEvents: Set[String] =
-      FirstTimeEvents.Maps ++ FirstTimeEvents.Monoliths ++
-        FirstTimeEvents.Standard.All ++ FirstTimeEvents.Cavern.All ++
-        FirstTimeEvents.TR.All ++ FirstTimeEvents.NC.All ++ FirstTimeEvents.VS.All ++
-        FirstTimeEvents.Generic,
-    /** Timestamps of when a vehicle or equipment was last purchased */
-    purchaseTimes: Map[String, LocalDateTime] = Map(),
-    /** Timestamps of when a vehicle or equipment was last purchased */
-    useTimes: Map[String, LocalDateTime] = Map()
+    decoration: ProgressDecoration = ProgressDecoration(),
+    loadouts: Loadouts = Loadouts(),
+    cooldowns: Cooldowns = Cooldowns(),
+    people: MemberLists = MemberLists(),
+    scorecard: ScoreCard = new ScoreCard(),
+    permissions: ModePermissions = ModePermissions()
 ) {
   assert(bep >= 0)
   assert(cep >= 0)
@@ -118,12 +155,23 @@ case class Avatar(
   val br: BattleRank  = BattleRank.withExperience(bep)
   val cr: CommandRank = CommandRank.withExperience(cep)
 
+  def name: String = basic.name
+
+  def faction: PlanetSideEmpire.Value = basic.faction
+
+  def sex: CharacterSex = basic.sex
+
+  def head: Int = basic.head
+
+  def voice: CharacterVoice.Value = basic.voice
+
   private def cooldown(
       times: Map[String, LocalDateTime],
       cooldowns: Map[BasicDefinition, FiniteDuration],
       definition: BasicDefinition
   ): Option[Duration] = {
-    times.get(definition.Name) match {
+    val (_, resolvedName) = AvatarActor.resolvePurchaseTimeName(faction, definition)
+    times.get(resolvedName) match {
       case Some(purchaseTime) =>
         val secondsSincePurchase = Seconds.secondsBetween(purchaseTime, LocalDateTime.now())
         cooldowns.get(definition) match {
@@ -138,12 +186,12 @@ case class Avatar(
 
   /** Returns the remaining purchase cooldown or None if an object is not on cooldown */
   def purchaseCooldown(definition: BasicDefinition): Option[Duration] = {
-    cooldown(purchaseTimes, Avatar.purchaseCooldowns, definition)
+    cooldown(cooldowns.purchase, Avatar.purchaseCooldowns, definition)
   }
 
   /** Returns the remaining use cooldown or None if an object is not on cooldown */
   def useCooldown(definition: BasicDefinition): Option[Duration] = {
-    cooldown(useTimes, Avatar.useCooldowns, definition)
+    cooldown(cooldowns.use, Avatar.useCooldowns, definition)
   }
 
   def fifthSlot(): EquipmentSlot = {
@@ -188,6 +236,10 @@ case class Avatar(
       case _ =>
         false
     }
+
+  override def hashCode(): Int = {
+    id
+  }
 
   /** Avatar assertions
     * These protect against programming errors by asserting avatar properties have correct values

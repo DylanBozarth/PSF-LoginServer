@@ -1,7 +1,7 @@
 // Copyright (c) 2021 PSForever
 package net.psforever.objects.vital.etc
 
-import net.psforever.objects.ballistics.{DeployableSource, SourceEntry}
+import net.psforever.objects.sourcing.{DeployableSource, SourceEntry}
 import net.psforever.objects.vital.base.{DamageReason, DamageResolution}
 import net.psforever.objects.vital.prop.DamageProperties
 import net.psforever.objects.vital.resolution.DamageAndResistance
@@ -17,19 +17,19 @@ import net.psforever.objects.vital.resolution.DamageAndResistance
 final case class TrippedMineReason(mine: DeployableSource, owner: SourceEntry)
   extends DamageReason {
 
-  def source: DamageProperties = mine.Definition.innateDamage.getOrElse(TrippedMineReason.triggered)
+  def source: DamageProperties = TrippedMineReason.triggered
 
   def resolution: DamageResolution.Value = DamageResolution.Resolved
 
   def same(test: DamageReason): Boolean = test match {
-    case trip: TrippedMineReason => mine == trip.mine && mine.OwnerName == trip.mine.OwnerName
-    case _                      => false
+    case trip: TrippedMineReason => mine.unique == trip.mine.unique && owner.unique == owner.unique
+    case _                       => false
   }
 
   /** lay the blame on the player who laid this mine, if possible */
   def adversary: Option[SourceEntry] = Some(owner)
 
-  override def damageModel : DamageAndResistance = mine.Definition
+  override def damageModel: DamageAndResistance = mine.Definition
 
   override def attribution: Int = mine.Definition.ObjectId
 }

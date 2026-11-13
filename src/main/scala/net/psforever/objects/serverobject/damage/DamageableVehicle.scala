@@ -2,16 +2,18 @@
 package net.psforever.objects.serverobject.damage
 
 import akka.actor.{Actor, Cancellable}
-import net.psforever.objects.{Vehicle, Vehicles}
+import net.psforever.objects.{Default, Vehicle, Vehicles}
 import net.psforever.objects.equipment.JammableUnit
 import net.psforever.objects.serverobject.damage.Damageable.Target
+import net.psforever.objects.sourcing.VehicleSource
 import net.psforever.objects.vital.base.DamageResolution
-import net.psforever.objects.vital.interaction.DamageResult
+import net.psforever.objects.vital.interaction.{Adversarial, DamageResult}
 import net.psforever.objects.vital.resolution.ResolutionCalculations
-import net.psforever.services.Service
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
 import net.psforever.objects.zones.Zone
-import net.psforever.packet.game.DamageWithPositionMessage
+import net.psforever.objects.zones.exp.ToDatabase
+import net.psforever.packet.game.packets.DamageWithPositionMessage
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.{PlanetsideAttribute, SendResponse}
 import net.psforever.types.Vector3
 
 import scala.concurrent.duration._
@@ -49,7 +51,7 @@ trait DamageableVehicle
         //bfrs undergo a shiver spell before exploding
         val obj = DamageableObject
         obj.Health = 0
-        obj.History(cause)
+        obj.LogActivity(cause)
         DestructionAwareness(obj, cause)
     }
 
@@ -73,8 +75,8 @@ trait DamageableVehicle
         val shields         = obj.Shields
         val damageToHealth  = originalHealth - health
         val damageToShields = originalShields - shields
-        if (WillAffectTarget(target, damageToHealth + damageToShields, cause)) {
-          target.History(cause)
+        if (WillAffectTarget(target, damageToHealth + damageToShields, cause) && !obj.protectedWhileZoning) {
+          target.LogActivity(cause)
           DamageLog(
             target,
             s"BEFORE=$originalHealth/$originalShields, AFTER=$health/$shields, CHANGE=$damageToHealth/$damageToShields"
@@ -100,10 +102,9 @@ trait DamageableVehicle
     * Most all vehicles and the weapons mounted to them can jam
     * if the projectile that strikes (near) them has jammering properties.
     * If this vehicle has shields that were affected by previous damage, that is also reported to the clients.
-    * @see `Service.defaultPlayerGUID`
+    * @see `Default.GUID0`
     * @see `Vehicle.CargoHolds`
-    * @see `VehicleAction.PlanetsideAttribute`
-    * @see `VehicleServiceMessage`
+    * @see `PlanetsideAttribute`
     * @param target the entity being destroyed
     * @param cause historical information about the damage
     * @param amount how much damage was performed
@@ -130,7 +131,7 @@ trait DamageableVehicle
 
     if (obj.MountedIn.nonEmpty) {
       //log historical event
-      target.History(cause)
+      target.LogActivity(cause)
     }
     //damage
     if (Damageable.CanDamageOrJammer(target, totalDamage, cause.interaction)) {
@@ -140,27 +141,27 @@ trait DamageableVehicle
       }
       //stat changes
       if (damageToShields > 0) {
-        events ! VehicleServiceMessage(
+        events ! MessageEnvelope(
           shieldChannel,
-          VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, targetGUID, obj.Definition.shieldUiAttribute, obj.Shields)
+          PlanetsideAttribute(targetGUID, obj.Definition.shieldUiAttribute, obj.Shields)
         )
         announceConfrontation = true
       }
       if (damageToHealth > 0) {
-        events ! VehicleServiceMessage(
+        events ! MessageEnvelope(
           healthChannel,
-          VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, targetGUID, 0, obj.Health)
+          PlanetsideAttribute(targetGUID, 0, obj.Health)
         )
         announceConfrontation = true
       }
     }
     if (announceConfrontation) {
       if (showAsAggravated) {
-        val msg = VehicleAction.SendResponse(Service.defaultPlayerGUID, DamageWithPositionMessage(totalDamage, Vector3.Zero))
+        val msg = SendResponse(DamageWithPositionMessage(totalDamage, Vector3.Zero))
         obj.Seats.values
           .collect { case seat if seat.occupant.nonEmpty => seat.occupant.get.Name }
           .foreach { channel =>
-            events ! VehicleServiceMessage(channel, msg)
+            events ! MessageEnvelope(channel, msg)
           }
       }
       else {
@@ -178,72 +179,117 @@ trait DamageableVehicle
     * Finally, the vehicle is tasked for deconstruction.
     * @see `Deployment.TryDeploymentChange`
     * @see `DriveState.Undeploying`
-    * @see `Service.defaultPlayerGUID`
+    * @see `Default.GUID0`
     * @see `Vehicle.CargoHolds`
-    * @see `VehicleAction.PlanetsideAttribute`
+    * @see `PlanetsideAttribute`
     * @see `RemoverActor.AddTask`
     * @see `RemoverActor.ClearSpecific`
-    * @see `VehicleServiceMessage`
-    * @see `VehicleServiceMessage.Decon`
     * @see `Zone.VehicleEvents`
     * @param target the entity being destroyed
     * @param cause historical information about the damage
     */
   override protected def DestructionAwareness(target: Target, cause: DamageResult): Unit = {
     (queuedDestruction, DamageableObject.Definition.destructionDelay) match {
+      case (_, None) => //explode now
+        destructionImmediate(target, cause)
       case (None, Some(delay)) => //set a future explosion for later
         destructionDelayed(delay, cause)
-      case (Some(_), _) | (None, None) => //explode now
-        super.DestructionAwareness(target, cause)
-        val obj = DamageableObject
-        val zone = target.Zone
-        //aggravation cancel
-        EndAllAggravation()
-        //passengers die with us
-        DamageableMountable.DestructionAwareness(obj, cause)
-        Zone.serverSideDamage(obj.Zone, target, Zone.explosionDamage(Some(cause)))
-        //special considerations for certain vehicles
-        Vehicles.BeforeUnloadVehicle(obj, zone)
-        //shields
-        if (obj.Shields > 0) {
-          obj.Shields = 0
-          zone.VehicleEvents ! VehicleServiceMessage(
-            zone.id,
-            VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, target.GUID, obj.Definition.shieldUiAttribute, 0)
-          )
-        }
-        //clean up
-        target.Actor ! Vehicle.Deconstruct(Some(1 minute))
-        target.ClearHistory()
-        DamageableWeaponTurret.DestructionAwareness(obj, cause)
-      case _ => ;
+      case (Some(_), _) => //destroy now that delay is expended (can also skip existing delay)
+        destructionAfterDelay(target, cause)
     }
+  }
+
+  def destructionImmediate(target: Target, cause: DamageResult): Unit = {
+    val obj = DamageableObject
+    val zone = target.Zone
+    obj.PrepareGatingManifest()
+    super.DestructionAwareness(target, cause)
+    //aggravation cancel
+    EndAllAggravation()
+    //passengers die with us
+    DamageableMountable.DestructionAwareness(obj, cause)
+    Zone.serverSideDamage(obj.Zone, target, Zone.explosionDamage(Some(cause)))
+    //special considerations for certain vehicles
+    Vehicles.BeforeUnloadVehicle(obj, zone)
+    //shields
+    if (obj.Shields > 0) {
+      obj.Shields = 0
+      zone.VehicleEvents ! MessageEnvelope(
+        zone.id,
+        PlanetsideAttribute(target.GUID, obj.Definition.shieldUiAttribute, 0)
+      )
+    }
+    //database entry
+    cause.adversarial.collect {
+      case Adversarial(attacker, victim: VehicleSource, implement) =>
+        ToDatabase.reportMachineDestruction(
+          attacker.CharId,
+          victim,
+          DamageableObject.HackedBy,
+          DamageableObject.MountedIn.nonEmpty,
+          implement,
+          obj.Zone.Number
+        )
+    }
+    //clean up
+    target.Actor ! Vehicle.Deconstruct(Some(1 minute))
+    DamageableWeaponTurret.DestructionAwareness(obj, cause)
   }
 
   def destructionDelayed(delay: Long, cause: DamageResult): Unit = {
     import scala.concurrent.ExecutionContext.Implicits.global
     import scala.concurrent.duration._
     val obj = DamageableObject
-    //health to 1, shields to 0
-    obj.Health = 1
-    obj.Shields = 0
-    val guid = obj.GUID
-    val guid0 = Service.defaultPlayerGUID
+    val guid0 = Default.GUID0
     val zone = obj.Zone
     val zoneid = zone.id
     val events = zone.VehicleEvents
-    events ! VehicleServiceMessage(
+    //health to 1, shields to 0
+    obj.Health = 1
+    val guid = obj.GUID
+    events ! MessageEnvelope(
       zoneid,
-      VehicleAction.PlanetsideAttribute(guid0, guid, 0, 1)
+      PlanetsideAttribute(guid, 0, 1)
     )
-    events ! VehicleServiceMessage(
-      zoneid,
-      VehicleAction.PlanetsideAttribute(guid0, guid, obj.Definition.shieldUiAttribute, 0)
-    )
+    if (obj.Shields > 0) {
+      obj.Shields = 0
+      events ! MessageEnvelope(
+        zone.id,
+        PlanetsideAttribute(obj.GUID, obj.Definition.shieldUiAttribute, 0)
+      )
+    }
+    //aggravation cancel
+    EndAllAggravation()
+    //special considerations for certain vehicles
+    Vehicles.BeforeUnloadVehicle(obj, zone)
+    //true death (expedited)
+    DamageableEntity.DestructionAwareness(obj, cause)
     //passengers die with us
     DamageableMountable.DestructionAwareness(DamageableObject, cause)
+    //database entry
+    cause.adversarial.collect {
+      case Adversarial(attacker, victim: VehicleSource, implement) =>
+        ToDatabase.reportMachineDestruction(
+          attacker.CharId,
+          victim,
+          DamageableObject.HackedBy,
+          DamageableObject.MountedIn.nonEmpty,
+          implement,
+          obj.Zone.Number
+        )
+    }
     //come back to this death later
     queuedDestruction = Some(context.system.scheduler.scheduleOnce(delay milliseconds, self, DamageableVehicle.Destruction(cause)))
+  }
+
+  def destructionAfterDelay(target: Target, cause: DamageResult): Unit = {
+    val obj = DamageableObject
+    obj.PrepareGatingManifest()
+    super.DestructionAwareness(target, cause)
+    Zone.serverSideDamage(obj.Zone, target, Zone.explosionDamage(Some(cause)))
+    //clean up
+    target.Actor ! Vehicle.Deconstruct(Some(1 minute))
+    DamageableWeaponTurret.DestructionAwareness(obj, cause)
   }
 }
 

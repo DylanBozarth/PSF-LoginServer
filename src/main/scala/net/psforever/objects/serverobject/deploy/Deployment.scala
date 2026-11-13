@@ -13,15 +13,15 @@ import net.psforever.types.DriveState
 trait Deployment {
   this: PlanetSideServerObject =>
 
-  private var deployState: DriveState.Value = DriveState.Mobile
+  private var deployState: DriveState = DriveState.Mobile
 
   def DeployTime: Int = 0 //ms
 
   def UndeployTime: Int = 0 //ms
 
-  def DeploymentState: DriveState.Value = deployState
+  def DeploymentState: DriveState = deployState
 
-  def DeploymentState_=(to_deploy_state: DriveState.Value): DriveState.Value = {
+  def DeploymentState_=(to_deploy_state: DriveState): DriveState = {
     deployState = to_deploy_state
     DeploymentState
   }
@@ -38,33 +38,33 @@ object Deployment {
     * A message for instigating a change in deployment state.
     * @param state the new deployment state
     */
-  final case class TryDeploymentChange(state: DriveState.Value)
+  final case class TryDeploymentChange(state: DriveState)
 
   /**
     * A message for instigating a change to a deploy state.
     * @param state the new deploy state
     */
-  final case class TryDeploy(state: DriveState.Value)
+  final case class TryDeploy(state: DriveState)
 
   /**
     * A message for instigating a change to an undeploy state.
     * @param state the new undeploy state
     */
-  final case class TryUndeploy(state: DriveState.Value)
+  final case class TryUndeploy(state: DriveState)
 
   /**
     * A response message to report successful deploy change.
     * @param obj the object being deployed
     * @param state the new deploy state
     */
-  final case class CanDeploy(obj: DeploymentObject, state: DriveState.Value)
+  final case class CanDeploy(obj: DeploymentObject, state: DriveState)
 
   /**
     * A response message to report successful undeploy change.
     * @param obj the object being undeployed
     * @param state the new undeploy state
     */
-  final case class CanUndeploy(obj: DeploymentObject, state: DriveState.Value)
+  final case class CanUndeploy(obj: DeploymentObject, state: DriveState)
 
   /**
     * A response message to report an unsuccessful deployment change.
@@ -72,7 +72,7 @@ object Deployment {
     * @param to_state the attempted deployment state
     * @param reason a string explaining why the state can not or will not change
     */
-  final case class CanNotChangeDeployment(obj: DeploymentObject, to_state: DriveState.Value, reason: String)
+  final case class CanNotChangeDeployment(obj: DeploymentObject, to_state: DriveState, reason: String)
 
   /**
     * Given a starting deployment state, provide the next deployment state in a sequence.<br>
@@ -80,18 +80,17 @@ object Deployment {
     * Two sequences are defined.
     * The more elaborate sequence proceeds from `Mobile --> Deploying --> Deployed --> Undeploying --> Mobile`.
     * This is the standard in-game deploy cycle.
-    * The sequence void of complexity is `State7 --> State7`.
-    * `State7` is an odd condition possessed mainly by vehicles that do not deploy.
+    * All other sequences are void of complexity and should not mutate from their original value.
     * @param from_state the original deployment state
     * @return the deployment state that is being transitioned
     */
-  def NextState(from_state: DriveState.Value): DriveState.Value = {
+  def NextState(from_state: DriveState): DriveState = {
     from_state match {
       case DriveState.Mobile      => DriveState.Deploying
       case DriveState.Deploying   => DriveState.Deployed
       case DriveState.Deployed    => DriveState.Undeploying
       case DriveState.Undeploying => DriveState.Mobile
-      case DriveState.State7      => DriveState.State7
+      case _                      => from_state
     }
   }
 
@@ -100,7 +99,7 @@ object Deployment {
     * @param state the state to check
     * @return yes, if it is a valid state; otherwise, false
     */
-  def CheckForDeployState(state: DriveState.Value): Boolean =
+  def CheckForDeployState(state: DriveState): Boolean =
     state == DriveState.Deploying || state == DriveState.Deployed
 
   /**
@@ -108,7 +107,7 @@ object Deployment {
     * @param state the state to check
     * @return yes, if it is a valid state; otherwise, false
     */
-  def CheckForUndeployState(state: DriveState.Value): Boolean =
+  def CheckForUndeployState(state: DriveState): Boolean =
     state == DriveState.Undeploying || state == DriveState.Mobile || state == DriveState.State7
 
   def AngleCheck(obj: Deployment.DeploymentObject): Boolean = {

@@ -2,7 +2,7 @@
 package net.psforever.objects.vital.etc
 
 import net.psforever.objects.GlobalDefinitions
-import net.psforever.objects.ballistics.{PlayerSource, SourceEntry}
+import net.psforever.objects.sourcing.{PlayerSource, SourceEntry}
 import net.psforever.objects.vital.{NoResistanceSelection, SimpleResolutions}
 import net.psforever.objects.vital.base.{DamageReason, DamageResolution}
 import net.psforever.objects.vital.damage.DamageCalculations.AgainstExoSuit
@@ -50,7 +50,6 @@ final case class TriggerUsedReason(user: PlayerSource, item_guid: PlanetSideGUID
 object TriggerUsedReason {
   private val triggered = new DamageProperties {
     Damage0 = 1 //token damage
-    SympatheticExplosion = true //sets off a boomer
   }
 
   /** basic damage, no resisting, quick and simple */

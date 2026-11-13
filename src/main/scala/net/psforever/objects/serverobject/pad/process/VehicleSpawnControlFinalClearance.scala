@@ -4,8 +4,9 @@ package net.psforever.objects.serverobject.pad.process
 import akka.actor.Cancellable
 import net.psforever.objects.Default
 import net.psforever.objects.serverobject.pad.{VehicleSpawnControl, VehicleSpawnPad}
-import net.psforever.types.{PlanetSideGUID, Vector3}
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.types.Vector3
+import net.psforever.services.vehicle.VehicleAction
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -35,41 +36,44 @@ class VehicleSpawnControlFinalClearance(pad: VehicleSpawnPad) extends VehicleSpa
         //ensure the vacant vehicle is above the trench and the doors
         vehicle.Position = pad.Position + Vector3.z(pad.Definition.VehicleCreationZOffset)
         val definition = vehicle.Definition
-        pad.Zone.VehicleEvents ! VehicleServiceMessage(
+        pad.Zone.VehicleEvents ! MessageEnvelope(
           s"${pad.Continent}",
-          VehicleAction.LoadVehicle(
-            PlanetSideGUID(0),
-            vehicle,
-            definition.ObjectId,
-            vehicle.GUID,
-            definition.Packet.ConstructorData(vehicle).get
-          )
+          VehicleAction.LoadVehicle(vehicle, definition.ObjectId, vehicle.GUID, definition.Packet.ConstructorData(vehicle).get)
         )
       }
       context.parent ! VehicleSpawnControl.ProcessControl.Reminder
       self ! VehicleSpawnControlFinalClearance.Test(order)
 
     case test @ VehicleSpawnControlFinalClearance.Test(entry) =>
-      //the vehicle has an initial decay of 30s in which time it needs to be mounted
+      //the vehicle has an initial decay in which time it needs to be mounted
       //once mounted, it will complain to the current driver that it is blocking the spawn pad
       //no time limit exists for that state
       val vehicle = entry.vehicle
-      if (Vector3.DistanceSquared(vehicle.Position, pad.Position) > 144) { //12m away from pad
-        trace("pad cleared")
-        pad.Zone.VehicleEvents ! VehicleSpawnPad.ResetSpawnPad(pad)
-        context.parent ! VehicleSpawnControl.ProcessControl.GetNewOrder
-      } else if (vehicle.Destroyed) {
-        trace("clearing the pad of vehicle wreckage")
+      val distanceTest = Vector3.DistanceSquared(vehicle.Position, pad.Position) > 144 //12m away from pad
+      if (vehicle.Destroyed) {
+        trace("pad cleared of vehicle wreckage")
+        val delay = if (distanceTest) { 2000 } else { 5000 }
         VehicleSpawnControl.DisposeVehicle(vehicle, pad.Zone)
-        context.parent ! VehicleSpawnControl.ProcessControl.GetNewOrder
+        temp = context.system.scheduler.scheduleOnce(delay.milliseconds, self, VehicleSpawnControlFinalClearance.NextOrder)
+      } else if (distanceTest) {
+        trace("pad cleared")
+        val delay = if (vehicle.Seats.head._2.occupant.isEmpty) { 4500 } else { 2000 }
+        temp = context.system.scheduler.scheduleOnce(delay.milliseconds, self, VehicleSpawnControlFinalClearance.NextOrder)
       } else {
-        temp = context.system.scheduler.scheduleOnce(2000 milliseconds, self, test)
+        //retry test
+        temp = context.system.scheduler.scheduleOnce(delay = 2000.milliseconds, self, test)
       }
 
-    case _ => ;
+    case VehicleSpawnControlFinalClearance.NextOrder =>
+      pad.Zone.VehicleEvents ! MessageEnvelope(pad.Zone.id, VehicleSpawnPad.ResetSpawnPad(pad))
+      context.parent ! VehicleSpawnControl.ProcessControl.GetNewOrder
+
+    case _ => ()
   }
 }
 
 object VehicleSpawnControlFinalClearance {
-  private final case class Test(entry: VehicleSpawnControl.Order)
+  private case class Test(entry: VehicleSpawnControl.Order)
+
+  private case object NextOrder
 }

@@ -1,10 +1,11 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects.serverobject.deploy
 
-import akka.actor.Actor
+import akka.actor.{Actor, ActorRef, Cancellable}
+import net.psforever.objects.Default
 import net.psforever.types.{DriveState, Vector3}
-import net.psforever.services.Service
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.vehicle.VehicleAction
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -22,28 +23,34 @@ import scala.concurrent.duration._
 trait DeploymentBehavior {
   _: Actor =>
 
+  private var deploymentTimer: Cancellable = Default.Cancellable
+
   def DeploymentObject: Deployment.DeploymentObject
+
+  def deploymentPostStop(): Unit = {
+    deploymentTimer.cancel()
+  }
 
   val deployBehavior: Receive = {
     case Deployment.TryDeploymentChange(state) =>
-      sender() ! TryDeploymentStateChange(state)
+      sender() ! TryDeploymentStateChange(state, sender())
 
     case Deployment.TryDeploy(state) =>
-      sender() ! TryDeployStateChange(state)
+      sender() ! TryDeployStateChange(state, sender())
 
     case Deployment.TryUndeploy(state) =>
-      sender() ! TryUndeployStateChange(state)
+      sender() ! TryUndeployStateChange(state, sender())
   }
 
-  def TryDeploymentStateChange(state: DriveState.Value): Any = {
+  def TryDeploymentStateChange(state: DriveState, replyTo: ActorRef): Any = {
     val obj       = DeploymentObject
     val prevState = obj.DeploymentState
     if (TryDeploymentChange(obj, state)) {
       if (Deployment.CheckForDeployState(state)) {
-        DeploymentAction(obj, state, prevState)
+        DeploymentAction(obj, state, prevState, replyTo)
         Deployment.CanDeploy(obj, state)
       } else {
-        UndeploymentAction(obj, state, prevState)
+        UndeploymentAction(obj, state, prevState, replyTo)
         Deployment.CanUndeploy(obj, state)
       }
     } else {
@@ -51,66 +58,65 @@ trait DeploymentBehavior {
     }
   }
 
-  def TryDeployStateChange(state: DriveState.Value): Any = {
+  def TryDeployStateChange(state: DriveState, replyTo: ActorRef): Any = {
     val obj       = DeploymentObject
     val prevState = obj.DeploymentState
     if (Deployment.CheckForDeployState(state) && TryDeploymentChange(obj, state)) {
-      DeploymentAction(obj, state, prevState)
+      DeploymentAction(obj, state, prevState, replyTo)
       Deployment.CanDeploy(obj, state)
     } else {
       Deployment.CanNotChangeDeployment(obj, state, "incorrect deploy transition state")
     }
   }
 
-  def TryUndeployStateChange(state: DriveState.Value): Any = {
+  def TryUndeployStateChange(state: DriveState, replyTo: ActorRef): Any = {
     val obj       = DeploymentObject
     val prevState = obj.DeploymentState
     if (Deployment.CheckForUndeployState(state) && TryUndeploymentChange(obj, state)) {
-      UndeploymentAction(obj, state, prevState)
+      UndeploymentAction(obj, state, prevState, replyTo)
       Deployment.CanUndeploy(obj, state)
     } else {
       Deployment.CanNotChangeDeployment(obj, state, "incorrect undeploy transition state")
     }
   }
 
-  def TryDeploymentChange(obj: Deployment.DeploymentObject, state: DriveState.Value): Boolean = {
+  def TryDeploymentChange(obj: Deployment.DeploymentObject, state: DriveState): Boolean = {
     DeploymentBehavior.TryDeploymentChange(obj, state)
   }
 
-  def TryUndeploymentChange(obj: Deployment.DeploymentObject, state: DriveState.Value): Boolean = {
+  def TryUndeploymentChange(obj: Deployment.DeploymentObject, state: DriveState): Boolean = {
     DeploymentBehavior.TryDeploymentChange(obj, state)
   }
 
   def DeploymentAction(
       obj: Deployment.DeploymentObject,
-      state: DriveState.Value,
-      prevState: DriveState.Value
-  ): DriveState.Value = {
+      state: DriveState,
+      prevState: DriveState,
+      replyTo: ActorRef
+  ): DriveState = {
     val guid        = obj.GUID
     val zone        = obj.Zone
     val zoneChannel = zone.id
-    val GUID0       = Service.defaultPlayerGUID
     //TODO remove this arbitrary allowance angle when no longer helpful
     if (obj.Orientation.x > 30 && obj.Orientation.x < 330) {
       obj.DeploymentState = prevState
       prevState
     } else if (state == DriveState.Deploying) {
       obj.Velocity = Some(Vector3.Zero) //no velocity
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zoneChannel,
-        VehicleAction.DeployRequest(GUID0, guid, state, 0, false, Vector3.Zero)
+        VehicleAction.DeployRequest(guid, state, 0, unk2=false, Vector3.Zero)
       )
-      context.system.scheduler.scheduleOnce(
-        obj.DeployTime milliseconds,
-        obj.Actor,
-        Deployment.TryDeploy(DriveState.Deployed)
-      )
+      deploymentTimer.cancel()
+      deploymentTimer = context.system.scheduler.scheduleOnce(obj.DeployTime.milliseconds)({
+        obj.Actor.tell(Deployment.TryDeploy(DriveState.Deployed), replyTo)
+      })
       state
     } else if (state == DriveState.Deployed) {
       obj.Velocity = Some(Vector3.Zero) //no velocity
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zoneChannel,
-        VehicleAction.DeployRequest(GUID0, guid, state, 0, false, Vector3.Zero)
+        VehicleAction.DeployRequest(guid, state, 0, unk2=false, Vector3.Zero)
       )
       state
     } else {
@@ -120,29 +126,28 @@ trait DeploymentBehavior {
 
   def UndeploymentAction(
       obj: Deployment.DeploymentObject,
-      state: DriveState.Value,
-      prevState: DriveState.Value
-  ): DriveState.Value = {
+      state: DriveState,
+      prevState: DriveState,
+      replyTo: ActorRef
+  ): DriveState = {
     val guid        = obj.GUID
     val zone        = obj.Zone
     val zoneChannel = zone.id
-    val GUID0       = Service.defaultPlayerGUID
     if (state == DriveState.Undeploying) {
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zoneChannel,
-        VehicleAction.DeployRequest(GUID0, guid, state, 0, false, Vector3.Zero)
+        VehicleAction.DeployRequest(guid, state, 0, unk2=false, Vector3.Zero)
       )
       import scala.concurrent.ExecutionContext.Implicits.global
-      context.system.scheduler.scheduleOnce(
-        obj.UndeployTime milliseconds,
-        obj.Actor,
-        Deployment.TryUndeploy(DriveState.Mobile)
-      )
+      deploymentTimer.cancel()
+      deploymentTimer = context.system.scheduler.scheduleOnce(obj.UndeployTime.milliseconds)({
+        obj.Actor.tell(Deployment.TryUndeploy(DriveState.Mobile), replyTo)
+      })
       state
     } else if (state == DriveState.Mobile) {
-      zone.VehicleEvents ! VehicleServiceMessage(
+      zone.VehicleEvents ! MessageEnvelope(
         zoneChannel,
-        VehicleAction.DeployRequest(GUID0, guid, state, 0, false, Vector3.Zero)
+        VehicleAction.DeployRequest(guid, state, 0, unk2=false, Vector3.Zero)
       )
       state
     } else {
@@ -152,7 +157,7 @@ trait DeploymentBehavior {
 }
 
 object DeploymentBehavior {
-  def TryDeploymentChange(obj: Deployment.DeploymentObject, state: DriveState.Value): Boolean = {
+  def TryDeploymentChange(obj: Deployment.DeploymentObject, state: DriveState): Boolean = {
     Deployment.NextState(obj.DeploymentState) == state && (obj.DeploymentState = state) == state
   }
 }

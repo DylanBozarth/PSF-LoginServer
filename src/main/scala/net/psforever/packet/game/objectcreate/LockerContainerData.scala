@@ -14,11 +14,7 @@ import shapeless.{::, HNil}
   */
 final case class LockerContainerData(inventory: Option[InventoryData]) extends ConstructorData {
   override def bitsize: Long = {
-    val base: Long = 105L
-    (inventory match {
-      case Some(inv) => inv.bitsize
-      case None      => 0L
-    }) + base //81u + 2u + 21u + 1u
+    105L + inventory.map(_.bitsize).getOrElse(0L) //81u + 2u + 21u + 1u
   }
 }
 
@@ -31,9 +27,11 @@ object LockerContainerData extends Marshallable[LockerContainerData] {
     new LockerContainerData(Some(InventoryData(inventory)))
 
   implicit val codec: Codec[LockerContainerData] = (
-    uint32 :: uint32 :: uint(17) ::
+    uint32 ::
+      uint32 ::
+      uint(bits = 17) ::
       uint2L ::
-      uint(21) ::
+      uint(bits = 21) ::
       ("inventory" | optional(bool, InventoryData.codec))
   ).exmap[LockerContainerData](
     {

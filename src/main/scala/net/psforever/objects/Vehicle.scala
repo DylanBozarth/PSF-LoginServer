@@ -1,24 +1,27 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects
 
-import net.psforever.objects.ce.InteractWithMines
+import net.psforever.objects.avatar.interaction.WithEntrance
+import net.psforever.objects.ce.{InteractWithMines, InteractWithTurrets}
 import net.psforever.objects.definition.{ToolDefinition, VehicleDefinition}
 import net.psforever.objects.equipment.{Equipment, EquipmentSize, EquipmentSlot, JammableUnit}
 import net.psforever.objects.inventory.{Container, GridInventory, InventoryItem, InventoryTile}
 import net.psforever.objects.serverobject.mount.{MountableEntity, Seat, SeatDefinition}
-import net.psforever.objects.serverobject.PlanetSideServerObject
+import net.psforever.objects.serverobject.{PlanetSideServerObject, environment}
 import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.aura.AuraContainer
 import net.psforever.objects.serverobject.deploy.Deployment
-import net.psforever.objects.serverobject.environment.InteractWithEnvironment
+import net.psforever.objects.serverobject.environment.interaction.common.{WithDeath, WithMovementTrigger}
 import net.psforever.objects.serverobject.hackable.Hackable
+import net.psforever.objects.serverobject.interior.{InteriorAwareFromInteraction, Sidedness}
 import net.psforever.objects.serverobject.structures.AmenityOwner
 import net.psforever.objects.vehicles._
+import net.psforever.objects.vehicles.interaction.{InteractWithForceDomeProtectionSeatedInVehicle, InteractWithRadiationCloudsSeatedInVehicle, TriggerOnVehicleRule, WithLava, WithWater}
 import net.psforever.objects.vital.resistance.StandardResistanceProfile
 import net.psforever.objects.vital.Vitality
 import net.psforever.objects.vital.resolution.DamageResistanceModel
-import net.psforever.objects.zones.InteractsWithZone
 import net.psforever.objects.zones.blockmap.BlockMapEntity
+import net.psforever.objects.zones.interaction.InteractsWithZone
 import net.psforever.packet.PlanetSideGamePacket
 import net.psforever.types.{PlanetSideEmpire, PlanetSideGUID, Vector3}
 
@@ -76,25 +79,35 @@ import scala.util.{Success, Try}
   */
 class Vehicle(private val vehicleDef: VehicleDefinition)
     extends AmenityOwner
-    with BlockMapEntity
-    with MountableWeapons
-    with InteractsWithZone
-    with Hackable
-    with FactionAffinity
-    with Deployment
-    with Vitality
-    with OwnableByPlayer
-    with StandardResistanceProfile
-    with JammableUnit
-    with CommonNtuContainer
-    with Container
-    with AuraContainer
-    with MountableEntity {
-  interaction(new InteractWithEnvironment())
-  interaction(new InteractWithMines(range = 20))
+      with BlockMapEntity
+      with MountableWeapons
+      with InteractsWithZone
+      with Hackable
+      with FactionAffinity
+      with Deployment
+      with Vitality
+      with OwnableByPlayer
+      with StandardResistanceProfile
+      with JammableUnit
+      with CommonNtuContainer
+      with Container
+      with AuraContainer
+      with MountableEntity
+      with InteriorAwareFromInteraction {
+  interaction(new InteractWithForceDomeProtectionSeatedInVehicle)
+  interaction(environment.interaction.InteractWithEnvironment(Seq(
+    new WithEntrance(),
+    new WithWater(),
+    new WithLava(),
+    new WithDeath(),
+    new WithMovementTrigger()
+  )))
+  interaction(new InteractWithMines(range = 20, TriggerOnVehicleRule))
+  interaction(new InteractWithTurrets())
   interaction(new InteractWithRadiationCloudsSeatedInVehicle(obj = this, range = 20))
 
   private var faction: PlanetSideEmpire.Value     = PlanetSideEmpire.NEUTRAL
+  private var previousFaction: PlanetSideEmpire.Value = PlanetSideEmpire.NEUTRAL
   private var shields: Int                        = 0
   private var decal: Int                          = 0
   private var trunkAccess: Option[PlanetSideGUID] = None
@@ -102,6 +115,7 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
   private var cloaked: Boolean                    = false
   private var flying: Option[Int]                 = None
   private var capacitor: Int                      = 0
+  var protectedWhileZoning: Boolean               = false
 
   /**
     * Permissions control who gets to access different parts of the vehicle;
@@ -113,13 +127,6 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
   private var utilities: Map[Int, Utility]       = Map.empty
   private var subsystems: List[VehicleSubsystem] = Nil
   private val trunk: GridInventory               = GridInventory()
-
-  /*
-    * Records the GUID of the cargo vehicle (galaxy/lodestar) this vehicle is stored in for DismountVehicleCargoMsg use
-    * DismountVehicleCargoMsg only passes the player_guid and this vehicle's guid
-    */
-  //private var mountedIn: Option[PlanetSideGUID] = None
-
   private var vehicleGatingManifest: Option[VehicleManifest]         = None
   private var previousVehicleGatingManifest: Option[VehicleManifest] = None
 
@@ -135,13 +142,17 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
   }
 
   def Faction: PlanetSideEmpire.Value = {
-    this.faction
-  }
-
-  override def Faction_=(faction: PlanetSideEmpire.Value): PlanetSideEmpire.Value = {
-    this.faction = faction
     faction
   }
+
+  override def Faction_=(toFaction: PlanetSideEmpire.Value): PlanetSideEmpire.Value = {
+    //TODO in the future, this may create an issue when the vehicle is originally or is hacked from Black Ops
+    previousFaction = faction
+    faction = toFaction
+    toFaction
+  }
+
+  def PreviousFaction: PlanetSideEmpire.Value = previousFaction
 
   /** How long it takes to jack the vehicle in seconds, based on the hacker's certification level */
   def JackingDuration: Array[Int] = Definition.JackingDuration
@@ -274,30 +285,7 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
   }
 
   def SeatPermissionGroup(seatNumber: Int): Option[AccessPermissionGroup.Value] = {
-    if (seatNumber == 0) { //valid in almost all cases
-      Some(AccessPermissionGroup.Driver)
-    } else {
-      Seat(seatNumber) match {
-        case Some(_) =>
-          Definition.controlledWeapons().get(seatNumber) match {
-            case Some(_) =>
-              Some(AccessPermissionGroup.Gunner)
-            case None =>
-              Some(AccessPermissionGroup.Passenger)
-          }
-        case None =>
-          CargoHold(seatNumber) match {
-            case Some(_) =>
-              Some(AccessPermissionGroup.Passenger) //TODO confirm this
-            case None =>
-              if (seatNumber >= trunk.Offset && seatNumber < trunk.Offset + trunk.TotalCapacity) {
-                Some(AccessPermissionGroup.Trunk)
-              } else {
-                None
-              }
-          }
-      }
-    }
+    Vehicles.SeatPermissionGroup(this.Definition, seatNumber)
   }
 
   def Utilities: Map[Int, Utility] = utilities
@@ -365,9 +353,9 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
     }
   }
 
-  override def DeployTime = Definition.DeployTime
+  override def DeployTime: Int = Definition.DeployTime
 
-  override def UndeployTime = Definition.UndeployTime
+  override def UndeployTime: Int = Definition.UndeployTime
 
   def Inventory: GridInventory = trunk
 
@@ -483,7 +471,7 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
     if (trunkAccess.isEmpty || trunkAccess.contains(player.GUID)) {
       groupPermissions(3) match {
         case VehicleLockState.Locked => //only the owner
-          Owner.isEmpty || (Owner.isDefined && player.GUID == Owner.get)
+          OwnerGuid.isEmpty || (OwnerGuid.isDefined && player.GUID == OwnerGuid.get)
         case VehicleLockState.Group => //anyone in the owner's squad or platoon
           faction == player.Faction //TODO this is not correct
         case VehicleLockState.Empire => //anyone of the owner's faction
@@ -511,7 +499,6 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
 
   def PrepareGatingManifest(): VehicleManifest = {
     val manifest = VehicleManifest(this)
-    seats.collect { case (index: Int, seat: Seat) if index > 0 => seat.unmount(seat.occupant) }
     vehicleGatingManifest = Some(manifest)
     previousVehicleGatingManifest = None
     manifest
@@ -526,10 +513,16 @@ class Vehicle(private val vehicleDef: VehicleDefinition)
 
   def PreviousGatingManifest(): Option[VehicleManifest] = previousVehicleGatingManifest
 
-  def DamageModel = Definition.asInstanceOf[DamageResistanceModel]
+  def DamageModel: DamageResistanceModel = Definition.asInstanceOf[DamageResistanceModel]
 
   override def BailProtection_=(protect: Boolean): Boolean = {
     !Definition.CanFly && super.BailProtection_=(protect)
+  }
+
+  override def WhichSide_=(thisSide: Sidedness): Sidedness = {
+    val toSide = super.WhichSide_=(thisSide)
+    (Seats.values ++ CargoHolds.values).flatMap(_.occupants).foreach(_.WhichSide = toSide)
+    toSide
   }
 
   /**
@@ -589,13 +582,6 @@ object Vehicle {
     * @see `VehicleControl`
     */
   final case class Reactivate()
-
-  /**
-    * A request has been made to charge this vehicle's shields.
-    * @see `FacilityBenefitShieldChargeRequestMessage`
-    * @param amount the number of points to charge
-    */
-  final case class ChargeShields(amount: Int)
 
   /**
     * Following a successful shield charge tick, display the results of the update.
@@ -696,6 +682,6 @@ object Vehicle {
     */
   def toString(obj: Vehicle): String = {
     val occupancy = obj.Seats.values.count(seat => seat.isOccupied)
-    s"${obj.Definition.Name}, owned by ${obj.Owner}: (${obj.Health}/${obj.MaxHealth})(${obj.Shields}/${obj.MaxShields}) ($occupancy)"
+    s"${obj.Definition.Name}, owned by ${obj.OwnerGuid}: (${obj.Health}/${obj.MaxHealth})(${obj.Shields}/${obj.MaxShields}) ($occupancy)"
   }
 }

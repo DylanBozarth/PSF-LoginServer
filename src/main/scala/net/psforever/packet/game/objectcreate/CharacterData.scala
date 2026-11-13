@@ -1,8 +1,9 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.packet.game.objectcreate
 
-import net.psforever.objects.avatar.Cosmetic
+import net.psforever.objects.avatar.BattleRank
 import net.psforever.packet.{Marshallable, PacketHelpers}
+import net.psforever.types.{Cosmetic, UniformStyle}
 import scodec.codecs._
 import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
@@ -17,31 +18,13 @@ import shapeless.{::, HNil}
 object ImplantEffects extends Enumeration {
   type Type = Value
 
-  val SurgeEffects          = Value(9)
-  val PersonalShieldEffects = Value(5)
-  val DarklightEffects      = Value(3)
-  val RegenEffects          = Value(0)
-  val NoEffects             = Value(1)
+  val SurgeEffects: ImplantEffects.Value          = Value(9)
+  val PersonalShieldEffects: ImplantEffects.Value = Value(5)
+  val DarklightEffects: ImplantEffects.Value      = Value(3)
+  val RegenEffects: ImplantEffects.Value          = Value(0)
+  val NoEffects: ImplantEffects.Value             = Value(1)
 
-  implicit val codec = PacketHelpers.createEnumerationCodec(this, uint4L)
-}
-
-/**
-  * Values for the four different color designs that impact a player's uniform.
-  * Exo-suits get minor graphical updates at the following battle rank levels: seven (1), fourteen (2), and twenty-five (4).
-  * The values 3 and 5 also exist and are visually descriptive to the third upgrade.
-  */
-object UniformStyle extends Enumeration {
-  type Type = Value
-
-  val Normal          = Value(0)
-  val FirstUpgrade    = Value(1)
-  val SecondUpgrade   = Value(2)
-  val SecondUpgradeEx = Value(3)
-  val ThirdUpgrade    = Value(4)
-  val ThirdUpgradeEx  = Value(5)
-
-  implicit val codec = PacketHelpers.createEnumerationCodec(this, uint(3))
+  implicit val codec: Codec[ImplantEffects.Value] = PacketHelpers.createEnumerationCodec(this, uint4)
 }
 
 /**
@@ -70,9 +53,9 @@ object UniformStyle extends Enumeration {
   *                     cosmetic armor associated with the command rank will be applied automatically
   * @param implant_effects the effects of implants that can be seen on a player's character;
   *                        the number of entries equates to the number of effects applied;
-  *                        the maximu number of effects is three
+  *                        the maximum number of effects is three
   * @param cosmetics optional decorative features that are added to the player's head model by console/chat commands;
-  *                  they become available at battle rank 24, but here they require the third uniform upgrade (rank 25);
+  *                  they become available at battle rank 24;
   *                  these flags do not exist if they are not applicable
   * @param is_backpack this player character should be depicted as a corpse;
   *                    corpses are either coffins (defunct), backpacks (normal), or a pastry (festive);
@@ -83,7 +66,7 @@ object UniformStyle extends Enumeration {
 final case class CharacterData(
     health: Int,
     armor: Int,
-    uniform_upgrade: UniformStyle.Value,
+    uniform_upgrade: UniformStyle,
     unk: Int,
     command_rank: Int,
     implant_effects: List[ImplantEffects.Value],
@@ -124,7 +107,7 @@ object CharacterData extends Marshallable[CharacterData] {
   def apply(
       health: Int,
       armor: Int,
-      uniform: UniformStyle.Value,
+      uniform: UniformStyle,
       cr: Int,
       implant_effects: List[ImplantEffects.Value],
       cosmetics: Option[Set[Cosmetic]]
@@ -136,10 +119,10 @@ object CharacterData extends Marshallable[CharacterData] {
       ("health" | uint8L) :: //dead state when health == 0
         ("armor" | uint8L) ::
         (("uniform_upgrade" | UniformStyle.codec) >>:~ { style =>
-        uint(3) :: //uniform_upgrade is actually interpreted as a 6u field, but the lower 3u seems to be discarded
-          ("command_rank" | uintL(3)) ::
-          listOfN(uint2, "implant_effects" | ImplantEffects.codec) ::
-          conditional(style.id > UniformStyle.SecondUpgrade.id, "cosmetics" | Cosmetic.codec)
+        uint(bits = 3) :: //uniform_upgrade is actually interpreted as a 6u field, but the lower 3u seems to be discarded
+        ("command_rank" | uint(bits = 3)) ::
+        ("implant_effects" | listOfN(uint2, ImplantEffects.codec)) ::
+        ("cosmetics" | conditional(BattleRank.showCosmetics(style), Cosmetic.codec))
       })
     ).exmap[CharacterData](
       {
@@ -175,24 +158,24 @@ object CharacterData extends Marshallable[CharacterData] {
   def codec_seated(is_backpack: Boolean): Codec[CharacterData] =
     (
       ("uniform_upgrade" | UniformStyle.codec) >>:~ { style =>
-        uint(3) :: //uniform_upgrade is actually interpreted as a 6u field, but the lower 3u seems to be discarded
-          ("command_rank" | uintL(3)) ::
-          listOfN(uint2, "implant_effects" | ImplantEffects.codec) ::
-          conditional(style.id > UniformStyle.SecondUpgrade.id, "cosmetics" | Cosmetic.codec)
+        uint(bits = 3) :: //uniform_upgrade is actually interpreted as a 6u field, but the lower 3u seems to be discarded
+        ("command_rank" | uint(bits = 3)) ::
+        ("implant_effects" | listOfN(uint2, ImplantEffects.codec)) ::
+        ("cosmetics" | conditional(BattleRank.showCosmetics(style), Cosmetic.codec))
       }
     ).exmap[CharacterData](
       {
         case uniform :: unk :: cr :: implant_effects :: cosmetics :: HNil =>
           Attempt.Successful(
             new CharacterData(
-              100,
-              0,
+              health = 100,
+              armor = 0,
               uniform,
               unk,
               cr,
               implant_effects,
               cosmetics
-            )(is_backpack, true)
+            )(is_backpack, is_seated = true)
           )
 
         case _ =>
@@ -200,12 +183,17 @@ object CharacterData extends Marshallable[CharacterData] {
       },
       {
         case CharacterData(_, _, uniform, unk, cr, implant_effects, cosmetics) =>
-          Attempt.Successful(uniform :: unk :: cr :: implant_effects :: cosmetics :: HNil)
+          val cos = if (BattleRank.showCosmetics(uniform)) {
+            cosmetics.orElse(Some(Set[Cosmetic]()))
+          } else {
+            None
+          }
+          Attempt.Successful(uniform :: unk :: cr :: implant_effects :: cos :: HNil)
 
         case _ =>
           Attempt.Failure(Err("invalid character data; can not decode"))
       }
     )
 
-  implicit val codec: Codec[CharacterData] = codec(false)
+  implicit val codec: Codec[CharacterData] = codec(is_backpack = false)
 }

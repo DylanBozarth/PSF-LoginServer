@@ -9,6 +9,7 @@ import net.psforever.objects.serverobject.PlanetSideServerObject
 import net.psforever.objects.serverobject.hackable.Hackable
 import net.psforever.types.BailType
 
+import scala.annotation.unused
 import scala.collection.mutable
 
 trait MountableBehavior {
@@ -45,11 +46,15 @@ trait MountableBehavior {
         case Some(seatNum) if mountTest(obj, seatNum, user) && tryMount(obj, seatNum, user) =>
           user.VehicleSeated = obj.GUID
           usedMountPoint.put(user.Name, mount_point)
-          obj.Zone.actor ! ZoneActor.RemoveFromBlockMap(user)
+          mountActionResponse(user, mount_point, seatNum)
           sender() ! Mountable.MountMessages(user, Mountable.CanMount(obj, seatNum, mount_point))
         case _ =>
           sender() ! Mountable.MountMessages(user, Mountable.CanNotMount(obj, mount_point))
       }
+  }
+
+  def mountActionResponse(user: Player, @unused mountPoint: Int, @unused seatIndex: Int): Unit = {
+    MountableObject.Zone.actor ! ZoneActor.RemoveFromBlockMap(user)
   }
 
   protected def mountTest(
@@ -65,7 +70,7 @@ trait MountableBehavior {
     !obj.Destroyed
   }
 
-  private def tryMount(
+  protected def tryMount(
                         obj: PlanetSideServerObject with Mountable,
                         seatNumber: Int,
                         player: Player
@@ -87,15 +92,19 @@ trait MountableBehavior {
       val obj = MountableObject
       if (dismountTest(obj, seat_number, user) && tryDismount(obj, seat_number, user, bail_type)) {
         user.VehicleSeated = None
-        obj.Zone.actor ! ZoneActor.AddToBlockMap(user, obj.Position)
+        dismountActionResponse(user, seat_number)
         sender() ! Mountable.MountMessages(
           user,
           Mountable.CanDismount(obj, seat_number, getUsedMountPoint(user.Name, seat_number))
         )
       }
       else {
-        sender() ! Mountable.MountMessages(user, Mountable.CanNotDismount(obj, seat_number))
+        sender() ! Mountable.MountMessages(user, Mountable.CanNotDismount(obj, seat_number, bail_type))
       }
+  }
+
+  def dismountActionResponse(user: Player, @unused seatIndex: Int): Unit = {
+    MountableObject.Zone.actor ! ZoneActor.AddToBlockMap(user, MountableObject.Position)
   }
 
   protected def dismountTest(
@@ -105,12 +114,12 @@ trait MountableBehavior {
                             ): Boolean = {
     obj.PassengerInSeat(user).contains(seatNumber) &&
     (obj.Seats.get(seatNumber) match {
-      case Some(seat) => seat.bailable || !obj.isMoving(test = 1)
+      case Some(seat) => seat.bailable || !obj.isMoving(test = 1f)
       case _          => false
     })
   }
 
-  private def tryDismount(
+  protected def tryDismount(
                            obj: Mountable,
                            seatNumber: Int,
                            user: Player,

@@ -1,25 +1,48 @@
 // Copyright (c) 2017 PSForever
 package net.psforever.objects.serverobject.terminals.implant
 
+import akka.actor.ActorRef
 import net.psforever.objects.serverobject.affinity.FactionAffinityBehavior
 import net.psforever.objects.serverobject.damage.Damageable.Target
 import net.psforever.objects.serverobject.damage.{Damageable, DamageableEntity, DamageableMountable}
-import net.psforever.objects.serverobject.hackable.{GenericHackables, HackableBehavior}
+import net.psforever.objects.serverobject.hackable.{GenericHackables, Hackable, HackableBehavior}
 import net.psforever.objects.serverobject.mount.{Mountable, MountableBehavior}
-import net.psforever.objects.serverobject.repair.{AmenityAutoRepair, RepairableEntity}
-import net.psforever.objects.serverobject.structures.{Building, PoweredAmenityControl}
-import net.psforever.objects.serverobject.terminals.capture.CaptureTerminalAwareBehavior
+import net.psforever.objects.serverobject.repair.{AmenityAutoRepair, RepairableAmenity, RepairableEntity}
+import net.psforever.objects.serverobject.structures.{Amenity, Building, PoweredAmenityControl}
+import net.psforever.objects.serverobject.terminals.Terminal
+import net.psforever.objects.serverobject.terminals.capture.{CaptureTerminal, CaptureTerminalAwareBehavior}
 import net.psforever.objects.serverobject.{CommonMessages, PlanetSideServerObject}
 import net.psforever.objects.vital.interaction.DamageResult
+import net.psforever.objects.zones.Zone
 import net.psforever.objects.{GlobalDefinitions, Player, SimpleItem}
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.packet.game.packets.HackState1
+import net.psforever.services.base.envelope.{BundledEnvelope, MessageEnvelope}
+import net.psforever.services.base.message.SetEmpire
+import net.psforever.services.vehicle.VehicleAction
+import net.psforever.types.{PlanetSideEmpire, PlanetSideGUID}
+
+import scala.annotation.unused
+
+object ImplantTerminalMechControl {
+  private def FindPairedTerminalInterface(
+                                           zone: Zone,
+                                           mechGuid: PlanetSideGUID
+                                         ): Option[Amenity with Hackable] = {
+    zone
+      .map
+      .terminalToInterface
+      .find { case (guid, _) => guid == mechGuid.guid }
+      .flatMap { case (_, interfaceGuid) => zone.GUID(interfaceGuid) }
+      .collect { case terminal: Terminal if !terminal.Destroyed && terminal.HackedBy.isEmpty => terminal }
+  }
+}
 
 /**
-  * An `Actor` that handles messages being dispatched to a specific `ImplantTerminalMech`.
-  * @param mech the "mech" object being governed
-  */
+ * An `Actor` that handles messages being dispatched to a specific `ImplantTerminalMech`.
+ * @param mech the "mech" object being governed
+ */
 class ImplantTerminalMechControl(mech: ImplantTerminalMech)
-    extends PoweredAmenityControl
+  extends PoweredAmenityControl
     with FactionAffinityBehavior.Check
     with MountableBehavior
     with HackableBehavior.GenericHackable
@@ -27,13 +50,13 @@ class ImplantTerminalMechControl(mech: ImplantTerminalMech)
     with RepairableEntity
     with AmenityAutoRepair
     with CaptureTerminalAwareBehavior {
-  def MountableObject  = mech
-  def HackableObject   = mech
-  def FactionObject    = mech
-  def DamageableObject = mech
-  def RepairableObject = mech
-  def AutoRepairObject = mech
-  def CaptureTerminalAwareObject = mech
+  def MountableObject: ImplantTerminalMech            = mech
+  def HackableObject: ImplantTerminalMech             = mech
+  def FactionObject: ImplantTerminalMech              = mech
+  def DamageableObject: ImplantTerminalMech           = mech
+  def RepairableObject: ImplantTerminalMech           = mech
+  def AutoRepairObject: ImplantTerminalMech           = mech
+  def CaptureTerminalAwareObject: ImplantTerminalMech = mech
 
   def commonBehavior: Receive =
     checkBehavior
@@ -41,9 +64,11 @@ class ImplantTerminalMechControl(mech: ImplantTerminalMech)
       .orElse(takesDamage)
       .orElse(canBeRepairedByNanoDispenser)
       .orElse(autoRepairBehavior)
+      .orElse(captureTerminalAwareBehaviour)
 
   def poweredStateLogic : Receive =
     commonBehavior
+      .orElse(hackableBehavior)
       .orElse(mountBehavior)
       .orElse {
         case CommonMessages.Use(player, Some(item: SimpleItem))
@@ -53,18 +78,19 @@ class ImplantTerminalMechControl(mech: ImplantTerminalMech)
             case b: Building if (b.Faction != player.Faction || b.CaptureTerminalIsHacked) && mech.HackedBy.isEmpty =>
               sender() ! CommonMessages.Progress(
                 GenericHackables.GetHackSpeed(player, mech),
-                GenericHackables.FinishHacking(mech, player, 3212836864L),
-                GenericHackables.HackingTickAction(progressType = 1, player, mech, item.GUID)
+                GenericHackables.FinishHacking(mech, player, hackValue = -1, hackClearValue = -1),
+                GenericHackables.HackingTickAction(HackState1.Unk1, player, mech, item.GUID)
               )
-            case _ => ;
+            case _ => ()
           }
-        case _ => ;
+        case _ => ()
       }
 
   def unpoweredStateLogic: Receive =
     commonBehavior
+      .orElse(hackableBehavior)
       .orElse {
-        case _ => ;
+        case _ => ()
       }
 
   override protected def mountTest(
@@ -98,7 +124,6 @@ class ImplantTerminalMechControl(mech: ImplantTerminalMech)
   override protected def DestructionAwareness(target: Damageable.Target, cause: DamageResult): Unit = {
     super.DestructionAwareness(target, cause)
     DamageableMountable.DestructionAwareness(DamageableObject, cause)
-    target.ClearHistory()
   }
 
   override def PerformRepairs(target : Damageable.Target, amount : Int) : Int = {
@@ -120,20 +145,141 @@ class ImplantTerminalMechControl(mech: ImplantTerminalMech)
     val zone = mech.Zone
     val zoneId = zone.id
     val events = zone.VehicleEvents
-    mech.Seats.values.foreach(seat =>
-      seat.occupant match {
-        case Some(player) =>
+    events ! BundledEnvelope(mech.Seats.values.flatMap(seat =>
+      seat.occupant.collect {
+        case player =>
           seat.unmount(player)
           player.VehicleSeated = None
-          if (player.HasGUID) {
-            events ! VehicleServiceMessage(zoneId, VehicleAction.KickPassenger(player.GUID, 4, false, guid))
-          }
-        case None => ;
+          MessageEnvelope(zoneId, player.GUID, VehicleAction.KickPassenger(4, unk2=false, guid))
       }
-    )
+    ))
   }
 
   def powerTurnOnCallback(): Unit = {
     tryAutoRepair()
+  }
+
+  override def Restoration(obj: Target): Unit = {
+    super.Restoration(obj)
+    RepairableAmenity.RestorationOfHistory(obj)
+  }
+
+  override def performHack(player: Player, data: Option[Any], replyTo: ActorRef): Unit = {
+    //todo don't now how to properly hack this amenity
+    super.performHack(player, data, replyTo)
+    val zone = HackableObject.Zone
+    val guid = HackableObject.GUID
+    val localFaction = mech.Faction
+    val events = zone.LocalEvents
+    if (player.Faction == localFaction) {
+      if (mech.Owner.asInstanceOf[Building].CaptureTerminalIsHacked) {
+        //this is actually futile, as a hacked base does not grant access to the terminal
+        events ! MessageEnvelope(localFaction.toString, SetEmpire(guid, localFaction))
+      }
+      kickAllOccupantsNotOfFaction(zone, guid, mech, localFaction)
+    } else {
+      opposingFactionsMayAccess(zone, guid, localFaction)
+      kickAllOccupantsOfFaction(zone, guid, mech, localFaction)
+    }
+    ImplantTerminalMechControl
+      .FindPairedTerminalInterface(zone, guid)
+      .foreach(GenericHackables.FinishHacking(_, player, hackValue = -1, hackClearValue = -1)())
+  }
+
+  override def performClearHack(data: Option[Any], replyTo: ActorRef): Unit = {
+    //todo don't now how to properly unhack this amenity
+    HackableObject.HackedBy.collect { _ =>
+      super.performClearHack(data, replyTo)
+      val toFaction = HackableObject.Faction
+      val zone = HackableObject.Zone
+      val guid = HackableObject.GUID
+      noAccessByOpposingFactions(zone, guid, toFaction)
+      kickAllOccupantsNotOfFaction(zone, guid, mech, toFaction)
+    }
+  }
+
+  override protected def captureTerminalIsHacked(@unused terminal: CaptureTerminal): Unit = {
+    //todo don't now how to properly handle a hacked mech
+    super.captureTerminalIsHacked(terminal)
+    val zone = HackableObject.Zone
+    val guid = HackableObject.GUID
+    kickAllOccupantsNotOfFactionWithTest(zone, guid, mech, (_: PlanetSideEmpire.Value) => { true })
+  }
+
+  override protected def captureTerminalIsResecured(terminal: CaptureTerminal): Unit = {
+    //todo don't now how to properly handle a hacked mech
+    super.captureTerminalIsResecured(terminal)
+    //if hacked, correct
+    val zone = HackableObject.Zone
+    val guid = HackableObject.GUID
+    val toFaction = HackableObject.Faction
+    HackableObject.HackedBy.collect {
+      case hackInfo if hackInfo.hackerFaction != toFaction =>
+        opposingFactionsMayAccess(zone, guid, toFaction)
+    }
+  }
+
+  private def opposingFactionsMayAccess(
+                                         zone: Zone,
+                                         guid: PlanetSideGUID,
+                                         setToFaction: PlanetSideEmpire.Value
+                                       ): Unit = {
+    val events = zone.LocalEvents
+    events ! BundledEnvelope(opposingFactionsAre(setToFaction).toSeq.map { faction =>
+      MessageEnvelope(faction.toString, SetEmpire(guid, faction))
+    })
+  }
+
+  private def noAccessByOpposingFactions(
+                                          zone: Zone,
+                                          guid: PlanetSideGUID,
+                                          setToFaction: PlanetSideEmpire.Value
+                                        ): Unit = {
+    val events = zone.LocalEvents
+    events ! BundledEnvelope(opposingFactionsAre(setToFaction).toSeq.map { faction =>
+      MessageEnvelope(faction.toString, SetEmpire(guid, setToFaction))
+    })
+  }
+
+  private def opposingFactionsAre(faction: PlanetSideEmpire.Value): PlanetSideEmpire.ValueSet = {
+    PlanetSideEmpire
+      .values
+      .filterNot { f => f == PlanetSideEmpire.NEUTRAL && f == faction }
+  }
+
+  private def kickAllOccupantsOfFaction(
+                                         zone: Zone,
+                                         guid: PlanetSideGUID,
+                                         obj: Mountable,
+                                         isFaction: PlanetSideEmpire.Value
+                                       ): Unit = {
+    kickAllOccupantsNotOfFactionWithTest(zone, guid, obj, (a: PlanetSideEmpire.Value) => { a == isFaction })
+  }
+
+  private def kickAllOccupantsNotOfFaction(
+                                            zone: Zone,
+                                            guid: PlanetSideGUID,
+                                            obj: Mountable,
+                                            isFaction: PlanetSideEmpire.Value
+                                          ): Unit = {
+    kickAllOccupantsNotOfFactionWithTest(zone, guid, obj, (a: PlanetSideEmpire.Value) => { a != isFaction })
+  }
+
+  private def kickAllOccupantsNotOfFactionWithTest(
+                                                    zone: Zone,
+                                                    guid: PlanetSideGUID,
+                                                    obj: Mountable,
+                                                    test: PlanetSideEmpire.Value => Boolean
+                                                  ): Unit = {
+    val zoneId = zone.id
+    val events = zone.LocalEvents
+    events !  BundledEnvelope(obj.Seats.values.flatMap(seat =>
+      seat.occupant.collect {
+        case player if test(player.Faction) =>
+          seat.unmount(player)
+          player.VehicleSeated = None
+          MessageEnvelope(zoneId, player.GUID, VehicleAction.KickPassenger(4, unk2 = false, guid))
+      }
+    ))
   }
 }

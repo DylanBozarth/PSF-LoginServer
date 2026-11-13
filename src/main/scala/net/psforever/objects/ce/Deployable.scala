@@ -5,11 +5,12 @@ import net.psforever.objects._
 import net.psforever.objects.definition.DeployableDefinition
 import net.psforever.objects.serverobject.PlanetSideServerObject
 import net.psforever.objects.serverobject.affinity.FactionAffinity
+import net.psforever.objects.serverobject.interior.TraditionalInteriorAware
 import net.psforever.objects.vital.Vitality
 import net.psforever.objects.vital.resolution.DamageResistanceModel
 import net.psforever.objects.zones.ZoneAware
 import net.psforever.objects.zones.blockmap.BlockMapEntity
-import net.psforever.packet.game.DeployableIcon
+import net.psforever.packet.game.packets.DeployableIcon
 import net.psforever.types.PlanetSideEmpire
 
 trait BaseDeployable
@@ -18,7 +19,8 @@ trait BaseDeployable
     with BlockMapEntity
     with Vitality
     with OwnableByPlayer
-    with ZoneAware {
+    with ZoneAware
+    with TraditionalInteriorAware {
   private var faction: PlanetSideEmpire.Value = PlanetSideEmpire.NEUTRAL
   private var shields: Int                    = 0
 
@@ -29,9 +31,7 @@ trait BaseDeployable
     Shields
   }
 
-  def MaxShields: Int = {
-    0 //Definition.MaxShields
-  }
+  def MaxShields: Int = 0
 
   def MaxHealth: Int
 
@@ -74,18 +74,18 @@ object Deployable {
   }
 
   object Category {
-    def Of(item: DeployedItem.Value): DeployableCategory.Value = deployablesToCategories(item)
+    def Of(item: DeployedItem.Value): DeployableCategory = deployablesToCategories(item)
 
-    def Includes(category: DeployableCategory.Value): List[DeployedItem.Value] = {
+    def Includes(category: DeployableCategory): List[DeployedItem.Value] = {
       (for {
-        (ce: DeployedItem.Value, cat: DeployableCategory.Value) <- deployablesToCategories
+        (ce: DeployedItem.Value, cat: DeployableCategory) <- deployablesToCategories
         if cat == category
       } yield ce) toList
     }
 
-    def OfAll(): Map[DeployedItem.Value, DeployableCategory.Value] = deployablesToCategories
+    def OfAll(): Map[DeployedItem.Value, DeployableCategory] = deployablesToCategories
 
-    private val deployablesToCategories: Map[DeployedItem.Value, DeployableCategory.Value] = Map(
+    private val deployablesToCategories: Map[DeployedItem.Value, DeployableCategory] = Map(
       DeployedItem.boomer                      -> DeployableCategory.Boomers,
       DeployedItem.high_explosive_mine         -> DeployableCategory.Mines,
       DeployedItem.jammer_mine                 -> DeployableCategory.Mines,
@@ -113,7 +113,7 @@ object Deployable {
       DeployedItem.jammer_mine.id                 -> DeployableIcon.DisruptorMine,
       DeployedItem.spitfire_turret.id             -> DeployableIcon.SpitfireTurret,
       DeployedItem.spitfire_cloaked.id            -> DeployableIcon.ShadowTurret,
-      DeployedItem.spitfire_aa.id                 -> DeployableIcon.CerebusTurret,
+      DeployedItem.spitfire_aa.id                 -> DeployableIcon.cerberusTurret,
       DeployedItem.motionalarmsensor.id           -> DeployableIcon.MotionAlarmSensor,
       DeployedItem.sensor_shield.id               -> DeployableIcon.SensorDisruptor,
       DeployedItem.tank_traps.id                  -> DeployableIcon.TRAP,

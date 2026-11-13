@@ -1,10 +1,10 @@
 // Copyright (c) 2021 PSForever
 package net.psforever.objects.vehicles.control
 
-import akka.actor.Actor
+import akka.actor.{Actor, Cancellable}
 import net.psforever.objects._
-import net.psforever.services.Service
-import net.psforever.services.vehicle.{VehicleAction, VehicleServiceMessage}
+import net.psforever.services.base.envelope.MessageEnvelope
+import net.psforever.services.base.message.PlanetsideAttribute
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -16,7 +16,7 @@ trait VehicleCapacitance {
   _: Actor =>
   def CapacitanceObject: Vehicle
 
-  protected var capacitor = Default.Cancellable
+  protected var capacitor: Cancellable = Default.Cancellable
 
   startCapacitorTimer()
 
@@ -59,9 +59,9 @@ trait VehicleCapacitance {
 
   protected def showCapacitorCharge(): Unit = {
     val obj = CapacitanceObject
-    obj.Zone.VehicleEvents ! VehicleServiceMessage(
+    obj.Zone.VehicleEvents ! MessageEnvelope(
       self.toString(),
-      VehicleAction.PlanetsideAttribute(Service.defaultPlayerGUID, obj.GUID, 113, obj.Capacitor)
+      PlanetsideAttribute(obj.GUID, 113, obj.Capacitor)
     )
   }
 

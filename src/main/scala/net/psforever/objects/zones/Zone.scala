@@ -2,9 +2,9 @@
 package net.psforever.objects.zones
 
 import akka.actor.{ActorContext, ActorRef, Props}
-import net.psforever.objects.{PlanetSideGameObject, _}
-import net.psforever.objects.ballistics.{Projectile, SourceEntry}
-import net.psforever.objects.ce.Deployable
+import net.psforever.objects._
+import net.psforever.objects.ballistics.Projectile
+import net.psforever.objects.ce.{Deployable, DeployableCategory}
 import net.psforever.objects.equipment.Equipment
 import net.psforever.objects.guid.{NumberPoolHub, UniqueNumberOps, UniqueNumberSetup}
 import net.psforever.objects.guid.key.LoanedKey
@@ -32,24 +32,39 @@ import scalax.collection.GraphEdge._
 import scala.util.Try
 import akka.actor.typed
 import net.psforever.actors.session.AvatarActor
-import net.psforever.actors.zone.ZoneActor
-import net.psforever.objects.avatar.Avatar
+import net.psforever.actors.zone.{BuildingActor, ShootingRangeTargetSpawnerActor, ZoneActor}
+import net.psforever.actors.zone.building.WarpGateLogic
+import net.psforever.objects.avatar.{Avatar, AvatarBot, PlayerControl}
+import net.psforever.objects.definition.ObjectDefinition
 import net.psforever.objects.geometry.d3.VolumetricGeometry
 import net.psforever.objects.guid.pool.NumberPool
 import net.psforever.objects.serverobject.PlanetSideServerObject
 import net.psforever.objects.serverobject.affinity.FactionAffinity
 import net.psforever.objects.serverobject.doors.Door
+import net.psforever.objects.serverobject.environment.EnvironmentAttribute
+import net.psforever.objects.serverobject.interior.{InteriorAware, Sidedness}
 import net.psforever.objects.serverobject.locks.IFFLock
+import net.psforever.objects.serverobject.pad.VehicleSpawnPad
 import net.psforever.objects.serverobject.terminals.implant.ImplantTerminalMech
 import net.psforever.objects.serverobject.shuttle.OrbitalShuttlePad
+import net.psforever.objects.serverobject.terminals.{ProximityTerminal, Terminal}
 import net.psforever.objects.serverobject.tube.SpawnTube
-import net.psforever.objects.vehicles.UtilityType
+import net.psforever.objects.sourcing.SourceEntry
+import net.psforever.objects.vehicles.{MountedWeapons, UtilityType}
 import net.psforever.objects.vital.etc.ExplodingEntityReason
 import net.psforever.objects.vital.interaction.{DamageInteraction, DamageResult}
 import net.psforever.objects.vital.prop.DamageWithPosition
 import net.psforever.objects.vital.Vitality
-import net.psforever.objects.zones.blockmap.BlockMap
+import net.psforever.objects.zones.blockmap.{BlockMap, SectorPopulation}
+import net.psforever.packet.game.packets.EmpireBenefitsMessage.{ZoneBenefit, ZoneLock, ZoneLockBenefit, ZoneLockZone}
+import net.psforever.packet.game.packets.{EmpireBenefitsMessage, PropertyOverrideMessage}
 import net.psforever.services.Service
+import net.psforever.zones.Zones
+
+import java.util.concurrent.atomic.AtomicInteger
+import scala.annotation.tailrec
+import scala.collection.mutable
+import scala.concurrent.{Future, Promise}
 
 /**
   * A server object representing the one-landmass planets as well as the individual subterranean caverns.<br>
@@ -63,24 +78,47 @@ import net.psforever.services.Service
   * Dynamic game objects originate from player characters.
   * (Write more later.)
   *
-  * @param id         the privileged name that can be used as the second parameter in the packet `LoadMapMessage`
-  * @param map        the map of server objects upon which this `Zone` is based
-  * @param zoneNumber the numerical index of the `Zone` as it is recognized in a variety of packets;
-  *                   also used by `LivePlayerList` to indicate a specific `Zone`
-  * @see `ZoneMap`<br>
-  *      `LoadMapMessage`<br>
-  *      `LivePlayerList`
+  * @param info predefined information pertaining to the zone
+  * @param map map of server objects upon which this `Zone` is based
+  * @see `ZoneMap`
+  * @see `LoadMapMessage`
+  * @see `LivePlayerList`
   */
-class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
+class Zone(info: DefinedZoneInfo, val map: ZoneMap) {
+  /**
+   * Overloaded constructor.
+   * The zone info does not officially exist so an anonymous info ojbect is constructed specifically for this zone.
+   * @param zoneId privileged name that can be used as the second parameter in the packet `LoadMapMessage`
+   * @param map map of server objects upon which this `Zone` is based
+   * @param zoneNumber numerical index of the `Zone` as it is recognized in a variety of packets
+   * @return a `Zone` object
+   */
+  def this(zoneId: String, map: ZoneMap, zoneNumber: Int) = {
+    this(
+      new DefinedZoneInfo {
+        def value: Int = zoneNumber
+        def name: String = zoneId
+        def id: String = zoneId
+        def mood: ZoneType = ZoneType.Continent
+        def map: MapInfo = null
+        def aliases: AliasLookup = ZoneInfo.defaultAliases
+      },
+      map
+    )
+  }
+
+  val id: String = info.id
+  lazy val isACavern: Boolean = info.mood == ZoneType.Cavern
+  lazy val isVR: Boolean = info.mood.isInstanceOf[VirtualReality]
 
   /** Governs general synchronized external requests. */
-  var actor: typed.ActorRef[ZoneActor.Command] = _
+  var actor: typed.ActorRef[ZoneActor.Command] = Default.typed.Actor
 
   /** Actor that handles SOI related functionality, for example if a player is in an SOI */
   private var soi = Default.Actor
 
   /** The basic support structure for the globally unique number system used by this `Zone`. */
-  private var guid: NumberPoolHub = new NumberPoolHub(new MaxNumberSource(65536))
+  private var guid: NumberPoolHub = new NumberPoolHub(new MaxNumberSource(max = 65536))
   /** The core of the unique number system, to which requests may be submitted.
     * @see `UniqueNumberSys`
     * @see `Zone.Init(ActorContext)`
@@ -122,6 +160,10 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
 
   /**
     */
+  private val bots: ListBuffer[AvatarBot] = ListBuffer[AvatarBot]()
+
+  /**
+    */
   private val corpses: ListBuffer[Player] = ListBuffer[Player]()
 
   private var projectiles: ActorRef = Default.Actor
@@ -130,6 +172,11 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
   /**
     */
   private var population: ActorRef = Default.Actor
+
+  /**
+   * Actor that handles non-player controlled entities, used for VR Shooting Range targets.
+   */
+  private var npcPopulation: ActorRef = Default.Actor
 
   private var buildings: PairMap[Int, Building] = PairMap.empty[Int, Building]
 
@@ -156,6 +203,8 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
   /** calculate a duration from a given interaction's participants */
   private var hotspotTimeFunc: (SourceEntry, SourceEntry) => FiniteDuration = Zone.HotSpot.Rules.NoTime
 
+  private val linkDynamicTurretWeapon: mutable.HashMap[Int, Int] = mutable.HashMap[Int, Int]()
+
   /**
     */
   private var avatarEvents: ActorRef = Default.Actor
@@ -169,163 +218,48 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
   private var vehicleEvents: ActorRef = Default.Actor
 
   /**
-    * Establish the basic accessible conditions necessary for a functional `Zone`.<br>
-    * <br>
-    * Called from the `Actor` that governs this `Zone` when it is passed a constructor reference to the `Zone`.
-    * Specifically, the order of calling follows: `InterstellarCluster.preStart -> ZoneActor.receive(Zone.Init()) -> Zone.Init`.
-    * The basic method performs three main operations.
-    * First, the `Actor`-driven aspect of the globally unique identifier system for this `Zone` is finalized.
-    * Second, all supporting `Actor` agents are created, e.g., `ground`.
-    * Third, the `ZoneMap` server objects are loaded and constructed within that aforementioned system.
-    * To avoid being called more than once, there is a test whether the globally unique identifier system has been changed.<br>
-    * <br>
-    * Execution of this operation should be fail-safe.
-    * The chances of failure should be mitigated or skipped.
-    * A testing routine should be run after the fact on the results of the process.
-    *
-    * @see `ZoneActor.ZoneSetupCheck`
+   * Is any player permitted to engage in weapons discharge in this zone?
+   */
+  private var liveFireAllowed: mutable.HashMap[PlanetSideEmpire.Value, Boolean] =
+    mutable.HashMap.from(PlanetSideEmpire.values.map { f => (f, true) })
+
+  /**
+    * When the zone has completed initializing, fulfill this promise.
+    * @see `init(ActorContext)`
+    */
+  private var zoneInitialized: Promise[Boolean] = Promise[Boolean]()
+
+  /**
+    * For ContinentalLockUpdateMessage
+    */
+  var lockedBy: PlanetSideEmpire.Value = PlanetSideEmpire.NEUTRAL
+
+  /**
+    * Used with lockedBy, but persists until another empire locks the cont
+    */
+  var benefitRecipient: PlanetSideEmpire.Value = PlanetSideEmpire.NEUTRAL
+
+  /**
+    * Holds the origin time of this zones
+    * @see `TimeOfDayMessage`
+    */
+  private var timeOfDayOrigin: Long = 0
+  private var timeOfDaySpeed: Float = 10.0f
+
+  /**
+    * When the zone has completed initializing, this will be the future.
+    * @see `init(ActorContext)`
+    */
+  def ZoneInitialized(): Future[Boolean] = zoneInitialized.future
+
+  /**
+    * Establish the basic accessible conditions necessary for a functional `Zone`.
+    * @see `Zone.init`
     * @param context a reference to an `ActorContext` necessary for `Props`
     */
   def init(implicit context: ActorContext): Unit = {
-    if (unops == null) {
-      SetupNumberPools()
-      context.actorOf(Props(classOf[UniqueNumberSys], this, this.guid), s"zone-$id-uns")
-      ground = context.actorOf(Props(classOf[ZoneGroundActor], this, equipmentOnGround), s"zone-$id-ground")
-      deployables = context.actorOf(Props(classOf[ZoneDeployableActor], this, constructions), s"zone-$id-deployables")
-      projectiles = context.actorOf(Props(classOf[ZoneProjectileActor], this, projectileList), s"zone-$id-projectiles")
-      transport = context.actorOf(Props(classOf[ZoneVehicleActor], this, vehicles), s"zone-$id-vehicles")
-      population = context.actorOf(Props(classOf[ZonePopulationActor], this, players, corpses), s"zone-$id-players")
-      projector = context.actorOf(
-        Props(classOf[ZoneHotSpotDisplay], this, hotspots, 15 seconds, hotspotHistory, 60 seconds),
-        s"zone-$id-hotspots"
-      )
-      soi = context.actorOf(Props(classOf[SphereOfInfluenceActor], this), s"zone-$id-soi")
-
-      avatarEvents = context.actorOf(Props(classOf[AvatarService], this), s"zone-$id-avatar-events")
-      localEvents = context.actorOf(Props(classOf[LocalService], this), s"zone-$id-local-events")
-      vehicleEvents = context.actorOf(Props(classOf[VehicleService], this), s"zone-$id-vehicle-events")
-
-      implicit val guid: NumberPoolHub = this.guid //passed into builderObject.Build implicitly
-      BuildLocalObjects(context, guid)
-      BuildSupportObjects()
-      MakeBuildings(context)
-      MakeLattice()
-      AssignAmenities()
-      CreateSpawnGroups()
-      PopulateBlockMap()
-
-      validate()
-    }
-  }
-
-  def validate(): Unit = {
-    implicit val log: Logger = org.log4s.getLogger(s"zone/$id/sanity")
-
-    //check bases
-    map.objectToBuilding.values
-      .toSet[Int]
-      .foreach(building_id => {
-        val target = Building(building_id)
-        if (target.isEmpty) {
-          log.error(s"expected a building for id #$building_id")
-        } else if (!target.get.HasGUID) {
-          log.error(s"building #$building_id was not registered")
-        }
-      })
-
-    //check base to object associations
-    map.objectToBuilding.keys.foreach(object_guid =>
-      if (guid(object_guid).isEmpty) {
-        log.error(s"expected object id $object_guid to exist, but it did not")
-      }
-    )
-
-    //check door to lock association
-    map.doorToLock.foreach({
-      case (doorGuid, lockGuid) =>
-        validateObject(doorGuid, (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.doors.Door], "door")
-        validateObject(lockGuid, (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.locks.IFFLock], "IFF lock")
-    })
-
-    //check vehicle terminal to spawn pad association
-    map.terminalToSpawnPad.foreach({
-      case (termGuid, padGuid) =>
-        validateObject(
-          termGuid,
-          (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.terminals.Terminal],
-          "vehicle terminal"
-        )
-        validateObject(
-          padGuid,
-          (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.pad.VehicleSpawnPad],
-          "vehicle spawn pad"
-        )
-    })
-
-    //check implant terminal mech to implant terminal interface association
-    map.terminalToInterface.foreach({
-      case (mechGuid, interfaceGuid) =>
-        validateObject(
-          mechGuid,
-          (x: PlanetSideGameObject) => x.isInstanceOf[ImplantTerminalMech],
-          "implant terminal mech"
-        )
-        validateObject(
-          interfaceGuid,
-          (o: PlanetSideGameObject) => o.isInstanceOf[serverobject.terminals.Terminal],
-          "implant terminal interface"
-        )
-    })
-
-    //check manned turret to weapon association
-    map.turretToWeapon.foreach({
-      case (turretGuid, weaponGuid) =>
-        validateObject(
-          turretGuid,
-          (o: PlanetSideGameObject) => o.isInstanceOf[serverobject.turret.FacilityTurret],
-          "facility turret mount"
-        )
-        if (
-          validateObject(
-            weaponGuid,
-            (o: PlanetSideGameObject) => o.isInstanceOf[net.psforever.objects.Tool],
-            "facility turret weapon"
-          )
-        ) {
-          if (GUID(weaponGuid).get.asInstanceOf[Tool].AmmoSlots.count(!_.Box.HasGUID) > 0) {
-            log.error(s"expected weapon $weaponGuid has an unregistered ammunition unit")
-          }
-        }
-    })
-  }
-
-  /**
-    * Recover an object from a collection and perform any number of validating tests upon it.
-    * If the object fails any tests, log an error.
-    *
-    * @param objectGuid  the unique indentifier being checked against the `guid` access point
-    * @param test        a test for the discovered object;
-    *                    expects at least `Type` checking
-    * @param description an explanation of how the object, if not discovered, should be identified
-    * @return `true` if the object was discovered and validates correctly;
-    *         `false` if the object failed any tests
-    */
-  def validateObject(
-      objectGuid: Int,
-      test: PlanetSideGameObject => Boolean,
-      description: String
-  )(implicit log: Logger): Boolean = {
-    try {
-      if (!test(GUID(objectGuid).get)) {
-        log.error(s"expected id $objectGuid to be a $description, but it was not")
-        false
-      } else {
-        true
-      }
-    } catch {
-      case e: Exception =>
-        log.error(s"expected a $description at id $objectGuid but no object is initialized - $e")
-        false
+    if(Zone.Setup.init(zone = this)) {
+      zoneInitialized.success(true)
     }
   }
 
@@ -337,34 +271,21 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
   ): List[(AmenityOwner, Iterable[SpawnPoint])] = {
     val ams = spawnGroups.contains(SpawnGroup.AMS)
     val structures = spawnGroups.collect {
-      case SpawnGroup.Facility =>
-        StructureType.Facility
-      case SpawnGroup.Tower =>
-        StructureType.Tower
-      case SpawnGroup.WarpGate =>
-        StructureType.WarpGate
-      case SpawnGroup.Sanctuary =>
-        StructureType.Building
+      case SpawnGroup.Facility => StructureType.Facility
+      case SpawnGroup.Tower => StructureType.Tower
+      case SpawnGroup.WarpGate => StructureType.WarpGate
+      case SpawnGroup.Sanctuary => StructureType.Building
     }
-
     SpawnGroups()
-      .filter {
-        case (building, spawns) =>
-          spawns.nonEmpty &&
-          spawns.exists(_.isOffline == false) &&
-          structures.contains(building.BuildingType)
-      }
-      .filter {
-        case (building, _) =>
-          building match {
-            case warpGate: WarpGate =>
-              warpGate.Faction == faction || warpGate.Faction == PlanetSideEmpire.NEUTRAL || warpGate.Broadcast
-            case _ =>
-              building.Faction == faction
-          }
-      }
-      .map {
-        case (building, spawns: List[SpawnPoint]) =>
+      .collect {
+        case (building, spawns)
+          if (building match {
+            case warpGate: WarpGate => warpGate.Faction == faction || warpGate.Broadcast(faction)
+            case _ => building.Faction == faction
+          }) &&
+            structures.contains(building.BuildingType) &&
+            spawns.nonEmpty &&
+            spawns.exists(_.isOffline == false) =>
           (building, spawns.filter(!_.isOffline))
       }
       .concat(
@@ -385,7 +306,6 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
           )
       )
       .toList
-
   }
 
   def findNearestSpawnPoints(
@@ -409,7 +329,7 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     *
     * @return the abstract index position of this `Zone`
     */
-  def Number: Int = zoneNumber
+  def Number: Int = info.value
 
   /**
     * The globally unique identifier system ensures that concurrent requests do not clash.
@@ -426,7 +346,7 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     * @return synchronized reference to the globally unique identifier system
     */
   def GUID(hub: NumberPoolHub): Boolean = {
-    if (actor == null && guid.Pools.values.foldLeft(0)(_ + _.Count) == 0) {
+    if (!zoneInitialized.isCompleted && guid.Pools.values.foldLeft(0)(_ + _.Count) == 0) {
       import org.fusesource.jansi.Ansi.Color.RED
       import org.fusesource.jansi.Ansi.ansi
       println(
@@ -460,6 +380,33 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     } else {
       None
     }
+  }
+
+  def GetEntities(definition: ObjectDefinition): List[PlanetSideGameObject] = {
+    GetEntities(List(definition))
+  }
+
+  def GetEntities(definitions: List[ObjectDefinition]): List[PlanetSideGameObject] = {
+    definitions
+      .distinct
+      .groupBy(_.registerAs)
+      .flatMap { case (registerName, defs) =>
+        GetEntities(registerName)
+          .filter(obj => defs.contains(obj.Definition))
+      }
+      .toList
+  }
+
+  def GetEntities(name: String): List[PlanetSideGameObject] = {
+    guid
+      .GetPool(name)
+      .map { pool =>
+        pool
+          .Numbers
+          .flatMap(guid.apply(_))
+          .collect { case obj: PlanetSideGameObject => obj }
+      }
+      .getOrElse(List[PlanetSideGameObject]())
   }
 
   /**
@@ -526,9 +473,15 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
 
   def Vehicles: List[Vehicle] = vehicles.toList
 
-  def Players: List[Avatar] = players.values.flatten.map(_.avatar).toList
+  def AllPlayers: List[Player] =  players.values.flatten.toList
 
-  def LivePlayers: List[Player] = players.values.flatten.toList
+  def Players: List[Avatar] = AllPlayers.map(_.avatar)
+
+  def BotAvatars: List[AvatarBot] = bots.toList
+
+  def LivePlayers: List[Player] = AllPlayers.filterNot(_.spectator)
+
+  def Spectator: List[Player] = AllPlayers.filter(_.spectator)
 
   def Corpses: List[Player] = corpses.toList
 
@@ -552,6 +505,8 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
 
   def Population: ActorRef = population
 
+  def NPCPopulation: ActorRef = npcPopulation
+
   def Buildings: Map[Int, Building] = buildings
 
   def Building(id: Int): Option[Building] = {
@@ -570,132 +525,22 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     lattice
   }
 
+  def AddIntercontinentalLatticeLink(bldgA: Building, bldgB: Building): Graph[Building, UnDiEdge] = {
+    if ((this eq bldgA.Zone) && (bldgA.Zone ne bldgB.Zone)) {
+      lattice ++= Set(bldgA ~ bldgB)
+    }
+    Lattice
+  }
+
+  def RemoveIntercontinentalLatticeLink(bldgA: Building, bldgB: Building): Graph[Building, UnDiEdge] = {
+    if ((this eq bldgA.Zone) && (bldgA.Zone ne bldgB.Zone)) {
+      lattice --= Set(bldgA ~ bldgB)
+    }
+    Lattice
+  }
+
   def zipLinePaths: List[ZipLinePath] = {
     map.zipLinePaths
-  }
-
-  private def BuildLocalObjects(implicit context: ActorContext, guid: NumberPoolHub): Unit = {
-    map.localObjects.foreach({ builderObject =>
-      builderObject.Build
-
-      val obj = guid(builderObject.Id)
-      obj collect {
-        case el: ZoneAware => el.Zone = this
-      }
-    })
-  }
-
-  private def BuildSupportObjects(): Unit = {
-    //guard against errors here, but don't worry about specifics; let ZoneActor.ZoneSetupCheck complain about problems
-    val other: ListBuffer[PlanetSideGameObject] = new ListBuffer[PlanetSideGameObject]()
-    //turret to weapon
-    map.turretToWeapon.foreach({
-      case (turret_guid, weapon_guid) =>
-        ((GUID(turret_guid) match {
-          case Some(obj: FacilityTurret) =>
-            Some(obj)
-          case _ => ;
-            None
-        }) match {
-          case Some(obj) =>
-            obj.Weapons.get(1) match {
-              case Some(slot) =>
-                Some(obj, slot.Equipment)
-              case None =>
-                None
-            }
-          case None =>
-            None
-        }) match {
-          case Some((obj, Some(weapon: Tool))) =>
-            guid.register(weapon, weapon_guid)
-            other ++= weapon.AmmoSlots.map(slot => slot.Box)
-            other ++= obj.Inventory.Items.map(item => item.obj) //internal ammunition reserves, if any
-          case _ => ;
-        }
-    })
-    //after all fixed GUID's are defined  ...
-    other.foreach(obj => guid.register(obj, obj.Definition.registerAs))
-  }
-
-  private def MakeBuildings(implicit context: ActorContext): PairMap[Int, Building] = {
-    val buildingList = map.localBuildings
-    val registrationKeys: Map[Int, Try[LoanedKey]] = buildingList.map {
-      case ((_, building_guid: Int, _), _) =>
-        (building_guid, guid.register(building_guid))
-    }
-    buildings = buildingList.map({
-      case ((name, building_guid, map_id), constructor) if registrationKeys(building_guid).isSuccess =>
-        val building = constructor.Build(name, building_guid, map_id, this)
-        registrationKeys(building_guid).get.Object = building
-        building_guid -> building
-    })
-    buildings
-  }
-
-  private def AssignAmenities(): Unit = {
-    map.objectToBuilding.foreach({
-      case (object_guid, building_id) =>
-        (buildings.get(building_id), guid(object_guid)) match {
-          case (Some(building), Some(amenity)) =>
-            building.Amenities = amenity.asInstanceOf[Amenity]
-          case (None, _) | (_, None) => ; //let ZoneActor's sanity check catch this error
-        }
-    })
-    //doors with nearby locks use those locks as their unlocking mechanism
-    //let ZoneActor's sanity check catch missing entities
-    map.doorToLock
-      .map { case(doorGUID: Int, lockGUID: Int) => (guid(doorGUID), guid(lockGUID)) }
-      .collect { case (Some(door: Door), Some(lock: IFFLock)) =>
-        door.Actor ! Door.UpdateMechanism(IFFLock.testLock(lock))
-      }
-    //ntu management (eventually move to a generic building startup function)
-    buildings.values
-      .flatMap(_.Amenities.filter(_.Definition == GlobalDefinitions.resource_silo))
-      .collect {
-        case silo: ResourceSilo =>
-          silo.Actor ! Service.Startup()
-      }
-    //some painfields need to look for their closest door
-    buildings.values
-      .flatMap(_.Amenities.filter(_.Definition.isInstanceOf[PainboxDefinition]))
-      .collect {
-        case painbox: Painbox =>
-          painbox.Actor ! "startup"
-      }
-    //the orbital_buildings in sanctuary zones have to establish their shuttle routes
-    map.shuttleBays
-      .map { guid(_) }
-      .collect { case Some(obj: OrbitalShuttlePad) =>
-        obj.Actor ! Service.Startup()
-      }
-    //allocate soi information
-    soi ! SOI.Build()
-  }
-
-  private def MakeLattice(): Unit = {
-    lattice ++= map.latticeLink.map {
-      case (source, target) =>
-        val (sourceBuilding, targetBuilding) = (Building(source), Building(target)) match {
-          case (Some(sBuilding), Some(tBuilding)) => (sBuilding, tBuilding)
-          case _ =>
-            throw new NoSuchElementException(s"Can't create lattice link between $source $target. Source is missing")
-        }
-        sourceBuilding ~ targetBuilding
-    }
-  }
-
-  private def CreateSpawnGroups(): Unit = {
-    buildings.values
-      .filterNot { _.Position == Vector3.Zero }
-      .map(building => { building -> building.Amenities.collect { case obj: SpawnPoint => obj } })
-      .filter({ case (_, spawns) => spawns.nonEmpty })
-      .foreach { SpawnGroups }
-
-    buildings.values
-      .filterNot { _.Position == Vector3.Zero }
-      .collect { case building: WarpGate => building -> List(building.asInstanceOf[SpawnPoint]) }
-      .foreach { SpawnGroups }
   }
 
   def SpawnGroups(): Map[Building, List[SpawnPoint]] = spawnGroups
@@ -716,15 +561,6 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     val entry: Map[Building, List[SpawnPoint]] = PairMap(building -> points)
     spawnGroups = spawnGroups ++ entry
     entry
-  }
-
-  def PopulateBlockMap(): Unit = {
-    vehicles.foreach { vehicle => blockMap.addTo(vehicle) }
-    buildings.values.foreach { building =>
-      blockMap.addTo(building)
-      building.Amenities.foreach { amenity => blockMap.addTo(amenity) }
-    }
-    map.environment.foreach { env => blockMap.addTo(env) }
   }
 
   def StartPlayerManagementSystems(): Unit = {
@@ -773,6 +609,42 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     HotSpotTimeFunction
   }
 
+  def GetTimeOfDay(): Float = {
+    val now = System.currentTimeMillis()
+    val timeDiff = now - timeOfDayOrigin
+
+    // get seconds
+    val diffSeconds = timeDiff / 1000
+
+    // apply speed factor
+    val elapsedTime = diffSeconds * timeOfDaySpeed
+
+    // wrap time to 24h
+    elapsedTime % 86400
+  }
+
+  def SetTimeOfDay(requestedTime: Float): Unit = {
+    val now = System.currentTimeMillis()
+
+    val requestedTimeDiff = requestedTime / timeOfDaySpeed
+
+    timeOfDayOrigin = now - (requestedTimeDiff * 1000.0).toLong
+  }
+
+  def GetTimeOfDaySpeed(): Float = {
+    timeOfDaySpeed
+  }
+
+  def SetTimeOfDaySpeed(requestedSpeed: Float): Unit = {
+    // store current time
+    val timeOfDay = GetTimeOfDay()
+
+    timeOfDaySpeed = requestedSpeed
+
+    // restore old time with new speed considered
+    SetTimeOfDay(timeOfDay)
+  }
+
   /**
     * Provide bulk correspondence on all map entities that can be composed into packet messages and reported to a client.
     * These messages are sent in this fashion at the time of joining the server:<br>
@@ -790,6 +662,8 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
     * @return the `Zone` object
     */
   def ClientInitialization(): Zone = this
+
+  def turretToWeapon: Map[Int, Int] = linkDynamicTurretWeapon.toMap[Int, Int] ++ map.turretToWeapon
 
   def AvatarEvents: ActorRef = avatarEvents
 
@@ -816,6 +690,182 @@ class Zone(val id: String, val map: ZoneMap, zoneNumber: Int) {
   def VehicleEvents_=(bus: ActorRef): ActorRef = {
     vehicleEvents = bus
     VehicleEvents
+  }
+
+  def LiveFireAllowed(): Boolean = liveFireAllowed.exists { case (_, v) => v }
+
+  def LiveFireAllowed(faction: PlanetSideEmpire.Value): Boolean = liveFireAllowed.getOrElse(faction, false)
+
+  def UpdateLiveFireAllowed(state: Boolean): List[(PlanetSideEmpire.Value, Boolean, Boolean)] = {
+    val output = liveFireAllowed.map { case (f, v) =>
+      (f, v == state, state)
+    }
+    output.foreach { case (f, _, v) =>
+      liveFireAllowed.update(f, v)
+    }
+    output.toList
+  }
+
+  def UpdateLiveFireAllowed(state: Boolean, faction: PlanetSideEmpire.Value): List[(PlanetSideEmpire.Value, Boolean, Boolean)] = {
+    val output = liveFireAllowed.map { case (f, v) =>
+      if (f == faction) {
+        (f, v == state, state)
+      } else {
+        (f, false, v)
+      }
+    }
+    liveFireAllowed.update(faction, state)
+    output.toList
+  }
+
+  def UpdateLiveFireAllowed(state: Boolean, factions: Seq[PlanetSideEmpire.Value]): List[(PlanetSideEmpire.Value, Boolean, Boolean)] = {
+    val output = liveFireAllowed.map { case (f, v) =>
+      if (factions.contains(f)) {
+        (f, v == state, state)
+      } else {
+        (f, false, v)
+      }
+    }
+    factions.foreach { f =>
+      liveFireAllowed.update(f, state)
+    }
+    output.toList
+  }
+
+  def NotifyContinentalLockBenefits(zone: Zone, building: Building): Unit = {
+    building.Actor ! BuildingActor.ContinentalLock(zone)
+    ApplyHomeLockBenefits(building)
+  }
+
+  def ApplyHomeLockBenefits(building: Building): Unit = {
+    val homeSets: Map[PlanetSideEmpire.Value, Set[Int]] = Map(
+      PlanetSideEmpire.TR -> Set(1, 2),
+      PlanetSideEmpire.VS -> Set(5, 6),
+      PlanetSideEmpire.NC -> Set(7, 10)
+    )
+    val homePerks: Map[PlanetSideEmpire.Value, String] = Map(
+      PlanetSideEmpire.TR -> "battlewagon 15mmbullet prowler 105mmbullet threemanheavybuggy heavy_grenade_mortar apc_tr",
+      PlanetSideEmpire.VS -> "magrider pulse_battery heavy_rail_beam_battery twomanhoverbuggy flux_cannon_thresher_battery aurora fluxpod_ammo apc_vs",
+      PlanetSideEmpire.NC -> "thunderer gauss_cannon_ammo twomanheavybuggy firebird_missile vanguard 150mmbullet apc_nc"
+    )
+
+    def isLockedBy(homeSet: Set[Int], empire: PlanetSideEmpire.Value): Boolean =
+      Zones.zones.filter(z => homeSet.contains(z.Number)).forall(_.benefitRecipient == empire)
+
+    val perks: Map[PlanetSideEmpire.Value, String] =
+      PlanetSideEmpire.values.map { empire =>
+        val empirePerks = homeSets.collect {
+          case (owner, zoneSet) if owner != empire && isLockedBy(zoneSet, empire) =>
+            homePerks(owner)
+        }
+        empire -> empirePerks.mkString(" ")
+      }.toMap
+
+    if (perks.values.forall(_.isEmpty)) {/*do nothing*/}
+    else {
+      val overrideMsg = PropertyOverrideMessage(List(PropertyOverrideMessage.GamePropertyScope(0, List(PropertyOverrideMessage.GamePropertyTarget(343,
+        List(PropertyOverrideMessage.GameProperty("purchase_exempt_vs", perks(PlanetSideEmpire.VS)),
+          PropertyOverrideMessage.GameProperty("purchase_exempt_tr", perks(PlanetSideEmpire.TR)),
+          PropertyOverrideMessage.GameProperty("purchase_exempt_nc", perks(PlanetSideEmpire.NC))))))))
+      building.Actor ! BuildingActor.HomeLockBenefits(overrideMsg)
+    }
+    val benefitMsg = BuildEmpireBenefits()
+    if (benefitMsg.zoneLocks.nonEmpty) {
+      building.Actor ! BuildingActor.HomeLockBenefits(benefitMsg)
+    }
+  }
+
+  def ApplyHomeLockBenefitsOnLogin(player: Player): Unit = {
+    val homeSets: Map[PlanetSideEmpire.Value, Set[Int]] = Map(
+      PlanetSideEmpire.TR -> Set(1, 2),
+      PlanetSideEmpire.VS -> Set(5, 6),
+      PlanetSideEmpire.NC -> Set(7, 10)
+    )
+    val homePerks: Map[PlanetSideEmpire.Value, String] = Map(
+      PlanetSideEmpire.TR -> "battlewagon 15mmbullet prowler 105mmbullet threemanheavybuggy heavy_grenade_mortar apc_tr",
+      PlanetSideEmpire.VS -> "magrider pulse_battery heavy_rail_beam_battery twomanhoverbuggy flux_cannon_thresher_battery aurora fluxpod_ammo apc_vs",
+      PlanetSideEmpire.NC -> "thunderer gauss_cannon_ammo twomanheavybuggy firebird_missile vanguard 150mmbullet apc_nc"
+    )
+
+    def isLockedBy(homeSet: Set[Int], empire: PlanetSideEmpire.Value): Boolean =
+      Zones.zones.filter(z => homeSet.contains(z.Number)).forall(_.benefitRecipient == empire)
+
+    val perks: Map[PlanetSideEmpire.Value, String] =
+      PlanetSideEmpire.values.map { empire =>
+        val empirePerks = homeSets.collect {
+          case (owner, zoneSet) if owner != empire && isLockedBy(zoneSet, empire) =>
+            homePerks(owner)
+        }
+        empire -> empirePerks.mkString(" ")
+      }.toMap
+
+    if (perks.values.forall(_.isEmpty)) {/*do nothing*/}
+    else {
+      val overrideMsg = PropertyOverrideMessage(List(PropertyOverrideMessage.GamePropertyScope(0, List(PropertyOverrideMessage.GamePropertyTarget(343,
+        List(PropertyOverrideMessage.GameProperty("purchase_exempt_vs", perks(PlanetSideEmpire.VS)),
+          PropertyOverrideMessage.GameProperty("purchase_exempt_tr", perks(PlanetSideEmpire.TR)),
+          PropertyOverrideMessage.GameProperty("purchase_exempt_nc", perks(PlanetSideEmpire.NC))))))))
+      PlayerControl.sendResponse(player.Zone, player.Name, overrideMsg)
+    }
+
+    val benefitMsg = BuildEmpireBenefits()
+    if (benefitMsg.zoneLocks.nonEmpty) {
+      PlayerControl.sendResponse(player.Zone, player.Name, benefitMsg)
+    }
+  }
+
+  def BuildEmpireBenefits(): EmpireBenefitsMessage = {
+    val locks = scala.collection.mutable.ArrayBuffer[ZoneLock]()
+    val benefits = scala.collection.mutable.ArrayBuffer[ZoneBenefit]()
+    val homeSets: Map[PlanetSideEmpire.Value, Set[Int]] = Map(
+      PlanetSideEmpire.TR -> Set(1, 2),
+      PlanetSideEmpire.VS -> Set(5, 6),
+      PlanetSideEmpire.NC -> Set(7, 10)
+    )
+    val benefitOfZones: Map[Int, Int] = Map(
+      3 -> 6,  // Cyssor gives benefit 6 (+10% armor bonus to vehicles)
+      4 -> 1,  // Ishundar gives benefit 1 (vehicle shields)
+      9 -> 3   // Searhus gives benefit 3 (faster respawn)
+    )
+    val homePerkBenefits: Map[PlanetSideEmpire.Value, Int] = Map(
+      PlanetSideEmpire.TR -> 7,
+      PlanetSideEmpire.NC -> 8,
+      PlanetSideEmpire.VS -> 9
+    )
+    def isLockedBy(homeSet: Set[Int], empire: PlanetSideEmpire.Value): Boolean =
+      Zones.zones.filter(z => homeSet.contains(z.Number)).forall(_.benefitRecipient == empire)
+
+    // home zone perks
+    homeSets.foreach { case (owner, set) =>
+      PlanetSideEmpire.values.filterNot(_ == PlanetSideEmpire.NEUTRAL).foreach { empire =>
+        if (owner != empire && isLockedBy(set, empire)) {
+          locks += ZoneLock(empire, s"lock-${owner.toString.toLowerCase}-homes")
+          benefits += ZoneBenefit(empire, ZoneLockBenefit(homePerkBenefits(owner)))
+        }
+      }
+    }
+
+    benefitOfZones.foreach { case (zoneNum, benefitId) =>
+      Zones.zones.find(_.Number == zoneNum).foreach { z =>
+        z.benefitRecipient match {
+          case PlanetSideEmpire.NEUTRAL =>
+          //nothing
+          case empire =>
+            locks += ZoneLock(empire, s"lock-z$zoneNum")
+            benefits += ZoneBenefit(empire, ZoneLockBenefit(benefitId))
+        }
+      }
+    }
+    // all four islands together give benefit 4 (vehicle repair)
+    val islandZones: Set[Int] = Set(29, 30, 31, 32)
+    val islandBenefit: Int = 4
+    PlanetSideEmpire.values.filterNot(_ == PlanetSideEmpire.NEUTRAL).foreach { empire =>
+      if (isLockedBy(islandZones, empire)) {
+        locks += ZoneLock(empire, ZoneLockZone.i1_i2_i3_i4)
+        benefits += ZoneBenefit(empire, ZoneLockBenefit(islandBenefit))
+      }
+    }
+    EmpireBenefitsMessage(locks.toVector, benefits.toVector)
   }
 }
 
@@ -856,6 +906,298 @@ object Zone {
     new Zone(id, map, number)
   }
 
+  private def AssignOutwardSideToDoors(zone: Zone): Unit = {
+    //let ZoneActor's sanity check catch any missing entities
+    //todo there are no doors in the training zones so we may skip that
+    if (zone.isACavern) {
+      //todo what do?
+      //almost all are type ancient_door and don't have many hints to determine outward-ness; there are no IFF locks
+    } else if (
+      PlanetSideEmpire.values
+        .filterNot(_ == PlanetSideEmpire.NEUTRAL)
+        .exists(fac => Zones.sanctuaryZoneNumber(fac) == zone.Number)
+    ) {
+      AssignOutwardSideToSanctuaryDoors(zone)
+    } else {
+      AssignOutwardSidetoContinentDoors(zone)
+    }
+  }
+
+  private def AssignOutwardSideToSanctuaryDoors(zone: Zone): Unit = {
+    val map = zone.map
+    val guid = zone.guid
+    AssignOutwardsToIFFLockedDoors(zone)
+    //doors with IFF locks belong to towers and are always between; the locks are always outside
+    map.doorToLock
+      .map { case (door, lock) => (guid(door), guid(lock)) }
+      .collect { case (Some(door: Door), Some(lock: IFFLock)) =>
+        door.WhichSide = Sidedness.StrictlyBetweenSides
+        lock.WhichSide = Sidedness.OutsideOf
+      }
+    //spawn building doors
+    val buildings = zone.Buildings.values
+    val amenityList = buildings
+      .collect {
+        case b
+          if b.Definition.Name.startsWith("VT_building_") =>
+          val amenities = b.Amenities
+          (
+            amenities.collect { case door: Door if door.Definition == GlobalDefinitions.gr_door_mb_ext => door },
+            amenities.collect { case door: Door if door.Definition == GlobalDefinitions.gr_door_mb_lrg => door },
+            amenities.filter(_.Definition == GlobalDefinitions.order_terminal),
+            amenities.filter(_.Definition == GlobalDefinitions.respawn_tube_sanctuary)
+          )
+      }
+    amenityList.foreach { case (entranceDoors, trainingRangeDoors, terminals, tubes) =>
+      entranceDoors.foreach { door =>
+        val doorPosition = door.Position
+        val closestTerminal = terminals.minBy(t => Vector3.DistanceSquared(doorPosition, t.Position))
+        val closestTube = tubes.minBy(t => Vector3.DistanceSquared(doorPosition, t.Position))
+        door.WhichSide = Sidedness.StrictlyBetweenSides
+        door.Outwards = Vector3.Unit(closestTerminal.Position.xy - closestTube.Position.xy)
+      }
+      //training zone warp doors
+      val sampleDoor = entranceDoors.head.Position.xy;
+      {
+        val doorToDoorVector = Vector3.Unit(sampleDoor - entranceDoors(1).Position.xy)
+        val (listADoors, listBDoors) = trainingRangeDoors
+          .sortBy(door => Vector3.DistanceSquared(door.Position.xy, sampleDoor))
+          .partition { door =>
+            Vector3.ScalarProjection(doorToDoorVector, Vector3.Unit(door.Position.xy - sampleDoor)) > 0f
+          }
+       Seq(listADoors, listBDoors)
+      }.foreach { doors =>
+        val door0PosXY = doors.head.Position.xy
+        val door1PosXY = doors(1).Position.xy
+        val door2PosXY = doors(2).Position.xy
+        val outwardsMiddle = Vector3.Unit((door0PosXY + door2PosXY) * 0.5f - door1PosXY)
+        val center = door1PosXY + (outwardsMiddle * 19.5926f)
+        doors.head.Outwards = Vector3.Unit(center - door0PosXY)
+        doors(1).Outwards = outwardsMiddle
+        doors(2).Outwards = Vector3.Unit(center - door2PosXY)
+      }
+    }
+    //hart building doors
+    buildings
+      .collect {
+        case b
+          if b.Definition.Name.startsWith("orbital_building_") =>
+          val amenities = b.Amenities
+          (
+            amenities.filter(_.Definition == GlobalDefinitions.gr_door_mb_ext),
+            amenities.filter(_.Definition == GlobalDefinitions.gr_door_mb_orb)
+          )
+      }
+      .foreach { case (entranceDoors, hartDoors) =>
+        entranceDoors.foreach { door =>
+          val isReallyADoor = door.asInstanceOf[Door]
+          val doorPosition = door.Position
+          val closestHartDoor = hartDoors.minBy(t => Vector3.DistanceSquared(doorPosition, t.Position))
+          isReallyADoor.WhichSide = Sidedness.StrictlyBetweenSides
+          isReallyADoor.Outwards = Vector3.Unit(doorPosition.xy - closestHartDoor.Position.xy)
+        }
+      }
+  }
+
+  private def AssignOutwardSidetoContinentDoors(zone: Zone): Unit = {
+    val map = zone.map
+    val guid = zone.guid
+    AssignOutwardsToIFFLockedDoors(zone)
+    val buildingsToDoors = zone.Buildings.values.map(b => (b, b.Amenities.collect { case d: Door => d })).toMap
+    //external doors with IFF locks are always between and outside, respectively
+    map.doorToLock
+      .map { case (door, lock) => (guid(door), guid(lock)) }
+      .collect { case (Some(door: Door), Some(lock: IFFLock))
+        if door.Definition.environmentField.exists(f => f.attribute == EnvironmentAttribute.InteriorField) =>
+        door.WhichSide = Sidedness.StrictlyBetweenSides
+        lock.WhichSide = Sidedness.OutsideOf
+      }
+    //for major facilities, external doors in the courtyard are paired, connected by a passage between ground and walls
+    //they are the only external doors that do not have iff locks
+    buildingsToDoors
+      .filter { case (b, _) => b.BuildingType == StructureType.Facility }
+      .foreach { case (_, doors) =>
+        var unpairedDoors = doors.collect {
+          case d: Door
+            if d.Definition == GlobalDefinitions.gr_door_ext && !map.doorToLock.contains(d.GUID.guid) =>
+            d
+        }
+        var pairedDoors = Seq[(Door, Door)]()
+        while (unpairedDoors.size > 1) {
+          val sampleDoor = unpairedDoors.head
+          val sampleDoorPosition = sampleDoor.Position.xy
+          val distances = Float.MaxValue +: unpairedDoors
+            .map(d => Vector3.DistanceSquared(d.Position.xy, sampleDoorPosition))
+            .drop(1)
+          val min = distances.min
+          val indexOfClosestDoor = distances.indexWhere(_ == min)
+          val otherDoor = unpairedDoors(indexOfClosestDoor)
+          unpairedDoors = unpairedDoors.slice(1, indexOfClosestDoor) ++ unpairedDoors.drop(indexOfClosestDoor + 1)
+          pairedDoors = pairedDoors :+ (sampleDoor, otherDoor)
+        }
+        pairedDoors.foreach { case (door1, door2) =>
+          //give each paired courtyard door an outward-ness
+          val outwards = Vector3.Unit(door1.Position.xy - door2.Position.xy)
+          door1.Outwards = outwards
+          door1.WhichSide = Sidedness.StrictlyBetweenSides
+          door2.Outwards = Vector3.neg(outwards)
+          door2.WhichSide = Sidedness.StrictlyBetweenSides
+        }
+      }
+    //bunkers do not define a formal interior, so their doors are solely exterior
+    buildingsToDoors
+      .filter { case (b, _) => b.BuildingType == StructureType.Bunker }
+      .foreach { case (_, doors) =>
+        doors.foreach(_.WhichSide = Sidedness.OutsideOf)
+      }
+  }
+
+  private def AssignOutwardsToIFFLockedDoors(zone: Zone): Unit = {
+    val guid = zone.guid
+    //doors with nearby locks use those locks as their unlocking mechanism and their outwards indication
+    zone.map.doorToLock
+      .map { case (doorGUID: Int, lockGUID: Int) => (guid(doorGUID), guid(lockGUID)) }
+      .collect {
+        case (Some(door: Door), Some(lock: IFFLock)) =>
+          door.Outwards = lock.Outwards
+          door.Actor ! Door.UpdateMechanism(IFFLock.testLock(lock))
+        case _ => ()
+      }
+  }
+
+  private def AssignSidednessToAmenities(zone: Zone): Unit = {
+    //let ZoneActor's sanity check catch any missing entities
+    //todo training zones, where everything is outside
+    if (zone.isACavern) {
+      //todo what do?
+      /*
+      quite a few amenities are disconnected from buildings
+      there are two orientations of terminal/spawn pad
+      as aforementioned, door outwards and sidedness is not assignable at the moment
+      */
+    } else if (
+      PlanetSideEmpire.values
+        .filterNot(_ == PlanetSideEmpire.NEUTRAL)
+        .exists(fac => Zones.sanctuaryZoneNumber(fac) == zone.Number)
+    ) {
+      AssignSidednessToSanctuaryAmenities(zone)
+    } else {
+      AssignSidednessToContinentAmenities(zone)
+    }
+  }
+
+  private def AssignSidednessToSanctuaryAmenities(zone: Zone): Unit = {
+    val map = zone.map
+    val guid = zone.guid
+    //only tower doors possess locks and those are always external
+    map.doorToLock
+      .map { case (_, lock) => guid(lock) }
+      .collect {
+        case Some(lock: IFFLock) =>
+          lock.WhichSide = Sidedness.OutsideOf
+      }
+    //medical terminals are always inside
+    zone.buildings
+      .values
+      .flatMap(_.Amenities)
+      .collect {
+        case pt: ProximityTerminal if pt.Definition == GlobalDefinitions.medical_terminal =>
+          pt.WhichSide = Sidedness.InsideOf
+      }
+    //repair silos and landing pads have multiple components and all of these are outside
+    //we have to search all terminal entities because the repair silos are not installed anywhere
+    guid
+      .GetPool(name = "terminals")
+      .map(_.Numbers.flatMap(number => guid(number)))
+      .getOrElse(List())
+      .collect {
+        case pt: ProximityTerminal
+          if pt.Definition == GlobalDefinitions.repair_silo =>
+          val guid = pt.GUID.guid
+          Seq(guid, guid + 1, guid + 2, guid + 3)
+        case pt: ProximityTerminal
+          if pt.Definition.Name.startsWith("pad_landing_") =>
+          val guid = pt.GUID.guid
+          Seq(guid, guid + 1, guid + 2)
+      }
+      .flatten[Int]
+      .map(guid(_))
+      .collect {
+        case Some(pt: ProximityTerminal) =>
+          pt.WhichSide = Sidedness.OutsideOf
+      }
+    //the following terminals are installed outside
+    map.terminalToSpawnPad
+      .keys
+      .flatMap(guid(_))
+      .collect {
+        case terminal: Terminal =>
+          terminal.WhichSide = Sidedness.OutsideOf
+      }
+  }
+
+  private def AssignSidednessToContinentAmenities(zone: Zone): Unit = {
+    val map = zone.map
+    val guid = zone.guid
+    val buildingsMap = zone.buildings.values
+    //door locks on external doors are also external while the door is merely "between"; all other locks are internal
+    map.doorToLock
+      .map { case (door, lock) => (guid(door), guid(lock))}
+      .collect {
+        case (Some(door: Door), Some(lock: IFFLock))
+          if door.Definition.environmentField.exists(f => f.attribute == EnvironmentAttribute.InteriorField) =>
+          lock.WhichSide = Sidedness.OutsideOf
+      }
+    //medical terminals are always inside
+    buildingsMap
+      .flatMap(_.Amenities)
+      .collect {
+        case pt: ProximityTerminal
+          if pt.Definition == GlobalDefinitions.medical_terminal || pt.Definition == GlobalDefinitions.adv_med_terminal =>
+          pt.WhichSide = Sidedness.InsideOf
+      }
+    //repair silos and landing pads have multiple components and all of these are outside
+    buildingsMap
+      .flatMap(_.Amenities)
+      .collect {
+        case pt: ProximityTerminal
+          if pt.Definition == GlobalDefinitions.repair_silo =>
+          val guid = pt.GUID.guid
+          Seq(guid, guid + 1, guid + 2, guid + 3)
+        case pt: ProximityTerminal
+          if pt.Definition.Name.startsWith("pad_landing_") =>
+          val guid = pt.GUID.guid
+          Seq(guid, guid + 1, guid + 2)
+      }
+      .toSeq
+      .flatten[Int]
+      .map(guid(_))
+      .collect {
+        case Some(pt: ProximityTerminal) =>
+          pt.WhichSide = Sidedness.OutsideOf
+      }
+    //all vehicle spawn pads are outside, save for the ground vehicle pad in the tech plants
+    buildingsMap.collect {
+      case b
+        if b.Definition == GlobalDefinitions.tech_plant =>
+        b.Amenities
+          .collect { case pad: VehicleSpawnPad => pad }
+          .minBy(_.Position.z)
+          .WhichSide = Sidedness.InsideOf
+    }
+    //all vehicle terminals are outside of their owning facilities in the courtyard
+    //the only exceptions are vehicle terminals in tech plants and the dropship center air terminal
+    map.terminalToSpawnPad
+      .keys
+      .flatMap(guid(_))
+      .collect {
+        case terminal: Terminal
+          if terminal.Definition != GlobalDefinitions.dropship_vehicle_terminal &&
+            terminal.Owner.asInstanceOf[Building].Definition != GlobalDefinitions.tech_plant =>
+          terminal.WhichSide = Sidedness.OutsideOf
+      }
+  }
+
   object Population {
 
     /**
@@ -872,7 +1214,7 @@ object Zone {
       * @see `PlayerHasLeft`
       * @param avatar the `Avatar` object
       */
-    final case class Leave(avatar: Avatar)
+    final case class Leave(avatar: Avatar, galaxyService: ActorRef)
 
     /**
       * Message that instructs the zone to disassociate a `Player` from this `Actor`.
@@ -882,7 +1224,7 @@ object Zone {
       * @param avatar the `Avatar` object
       * @param player the `Player` object
       */
-    final case class Spawn(avatar: Avatar, player: Player, avatarActor: typed.ActorRef[AvatarActor.Command])
+    final case class Spawn(avatar: Avatar, player: Player, avatarActor: typed.ActorRef[AvatarActor.Command], galaxyService: ActorRef)
 
     /**
       * Message that instructs the zone to disassociate a `Player` from this `Actor`.
@@ -914,6 +1256,21 @@ object Zone {
       * @param player the `Player` object
       */
     final case class PlayerCanNotSpawn(zone: Zone, player: Player)
+  }
+
+  object Bots {
+
+    /**
+      * Message that reports to the zone of a freshly spawned bot.
+      * @param bot the `AvatarBot`
+      */
+    final case class Spawn(bot: AvatarBot)
+
+    /**
+      * Message that tells the zone to no longer mind the bot.
+      * @param bot the `AvatarBot`
+      */
+    final case class Release(bot: AvatarBot)
   }
 
   object Corpse {
@@ -966,6 +1323,10 @@ object Zone {
     final case class CanNotSpawn(zone: Zone, vehicle: Vehicle, reason: String)
 
     final case class CanNotDespawn(zone: Zone, vehicle: Vehicle, reason: String)
+
+    final case class TryDeploymentChange(vehicle: Vehicle, toDeployState: DriveState)
+
+    final case class CanNotDeploy(zone: Zone, vehicle: Vehicle, toDeployState: DriveState, reason: String)
   }
 
   object HotSpot {
@@ -1053,6 +1414,8 @@ object Zone {
       */
     final case class InContainer(obj: Container, index: Int) extends ItemLocation
 
+    final case class Mounted(obj: MountedWeapons, index: Int) extends ItemLocation
+
     /**
       * The target item is found on the Ground.
       * @see `ZoneGroundActor`
@@ -1069,9 +1432,12 @@ object Zone {
       * and a token that qualifies the current location of the object in the zone is returned.
       * The following groups of objects are searched:
       * the inventories of all players and all corpses,
-      * all vehicles weapon mounts and trunks,
-      * the lockers of all players and corpses;
-      * and, if still not found, the ground is scoured too.
+     * the lockers of all players and corpses,
+     * all vehicles's weapon mounts and trunks,
+     * all weapon-mounted deployables's mounted turrets,
+     * all facilities's natural mounted turrets;
+     * and, if still not found, the ground is scoured too;
+     * and, if still not found after that, it __shouldn't__ exist (in this zone).
       * @see `ItemLocation`
       * @see `LockerContainer`
       * @param equipment the target object
@@ -1092,8 +1458,29 @@ object Zone {
           }).orElse(continent.Players.find(_.locker.Find(guid).nonEmpty) match {
             case Some(avatar) => Some((avatar.locker, avatar.locker.Find(guid)))
             case _            => None
-          }) match {
-            case Some((obj, Some(index))) =>
+          }).orElse({
+            (continent.DeployableList.filter( d => d.Definition.DeployCategory == DeployableCategory.FieldTurrets ) ++
+              continent.DeployableList.filter( d => d.Definition.DeployCategory == DeployableCategory.SmallTurrets )).find {
+              case w: MountedWeapons => w.Weapons.values.flatMap(_.Equipment).exists(_ eq equipment)
+              case _                 => false
+            } match {
+              case Some(deployable) => Some((deployable, Some(0)))
+              case _                => None
+            }
+          }).orElse({
+            continent.Buildings.values
+              .flatMap(_.Amenities).find {
+              case w: MountedWeapons => w.Weapons.values.flatMap(_.Equipment).exists(_ eq equipment)
+              case _                 => false
+            } match {
+              case Some(turret) => Some((turret.asInstanceOf[MountedWeapons], Some(0)))
+              case _            => None
+            }
+          })
+          match {
+            case Some((obj: MountedWeapons, Some(index))) =>
+              Some(Zone.EquipmentIs.Mounted(obj, index))
+            case Some((obj: Container, Some(index))) =>
               Some(Zone.EquipmentIs.InContainer(obj, index))
             case _ =>
               continent.EquipmentOnGround.find(_.GUID == guid) match {
@@ -1110,14 +1497,464 @@ object Zone {
   }
 
   /**
+    * Starting from an overworld zone facility,
+    * find a lattice connected cavern facility that is the same faction as this starting building.
+    * Except for the necessary examination of the major facility on the other side of a warp gate pair,
+    * do not let the search escape the current zone into another.
+    * If we start in a cavern zone, do not continue a fruitless search;
+    * just fail.
+    * @return the discovered faction-aligned cavern facility
+    */
+  def findConnectedCavernFacility(building: Building): Option[Building] = {
+    if (building.Zone.isACavern) {
+      None
+    } else {
+      val neighbors = building.AllNeighbours.getOrElse(Set.empty[Building]).toList
+      recursiveFindConnectedCavernFacility(building.Faction, neighbors.headOption, neighbors.drop(1), Set(building.MapId))
+    }
+  }
+
+  /**
+    * Starting from an overworld zone facility,
+    * find a lattice connected cavern facility that is the same faction as this starting building.
+    * Except for the necessary examination of the major facility on the other side of a warp gate pair,
+    * do not let the search escape the current zone into another.
+    * @param currBuilding the proposed current facility to check
+    * @param nextNeighbors the facilities that are yet to be searched
+    * @param visitedNeighbors the facilities that have been searched already
+    * @return the discovered faction-aligned cavern facility
+    */
+  @tailrec
+  private def recursiveFindConnectedCavernFacility(
+                                                    sampleFaction: PlanetSideEmpire.Value,
+                                                    currBuilding: Option[Building],
+                                                    nextNeighbors: List[Building],
+                                                    visitedNeighbors: Set[Int]
+                                                  ): Option[Building] = {
+    if(currBuilding.isEmpty) {
+      None
+    } else {
+      val building = currBuilding.head
+      if (!visitedNeighbors.contains(building.MapId)
+          && (building match {
+        case wg: WarpGate => wg.Faction == sampleFaction || wg.Broadcast(sampleFaction)
+        case _            => building.Faction == sampleFaction
+      })
+          && !building.CaptureTerminalIsHacked
+          && building.NtuLevel > 0
+          && (building.Generator match {
+        case Some(o) => o.Condition != PlanetSideGeneratorState.Destroyed
+        case _       => true
+      })
+      ) {
+        (building match {
+          case wg: WarpGate => traverseWarpGateInSearchOfOwnedCavernFaciity(sampleFaction, wg)
+          case _ => None
+        }) match {
+          case out @ Some(_) =>
+            out
+          case _ =>
+            val newVisitedNeighbors = visitedNeighbors ++ Set(building.MapId)
+            val newNeighbors = nextNeighbors ++ building.AllNeighbours
+              .getOrElse(Set.empty[Building])
+              .toList
+              .filterNot { b => newVisitedNeighbors.contains(b.MapId) }
+            recursiveFindConnectedCavernFacility(
+              sampleFaction,
+              newNeighbors.headOption,
+              newNeighbors.drop(1),
+              newVisitedNeighbors
+            )
+        }
+      } else {
+        recursiveFindConnectedCavernFacility(
+          sampleFaction,
+          nextNeighbors.headOption,
+          nextNeighbors.drop(1),
+          visitedNeighbors ++ Set(building.MapId)
+        )
+      }
+    }
+  }
+
+  /**
+    * Trace the extended neighborhood of the warp gate to a cavern facility that has the same faction affinity.
+    * @param faction the faction that all connected factions must have affinity with
+    * @param target the warp gate from which to conduct a local search
+    * @return if discovered, the first faction affiliated facility in a connected cavern
+    */
+  private def traverseWarpGateInSearchOfOwnedCavernFaciity(
+                                                            faction: PlanetSideEmpire.Value,
+                                                            target: WarpGate
+                                                          ): Option[Building] = {
+    WarpGateLogic.findNeighborhoodWarpGate(target.Neighbours.getOrElse(Nil)) match {
+      case Some(gate) if gate.Zone.isACavern =>
+        WarpGateLogic.findNeighborhoodNormalBuilding(gate.Neighbours(faction).getOrElse(Nil))
+      case _ =>
+        None
+    }
+  }
+
+  def AmsSpawnPoints(zone: Zone): List[SpawnTube] = {
+    import net.psforever.objects.vehicles.UtilityType
+    import net.psforever.objects.GlobalDefinitions
+    zone.Vehicles
+      .filter(veh =>
+        veh.Health > 0 && veh.Definition == GlobalDefinitions.ams && veh.DeploymentState == DriveState.Deployed
+      )
+      .flatMap(veh => veh.Utilities.values.filter(util => util.UtilType == UtilityType.ams_respawn_tube))
+      .map(util => util().asInstanceOf[SpawnTube])
+  }
+
+  object Setup {
+    /* zone setup code */
+
+    /**
+     * Establish the basic accessible conditions necessary for a functional `Zone`.<br>
+     * <br>
+     * Called from the `Actor` that governs this `Zone` when it is passed a constructor reference to the `Zone`.
+     * Specifically, the order of calling follows: `InterstellarCluster.preStart -> ZoneActor.receive(Zone.Init()) -> Zone.Init`.
+     * The basic method performs three main operations.
+     * First, the `Actor`-driven aspect of the globally unique identifier system for this `Zone` is finalized.
+     * Second, all supporting `Actor` agents are created, e.g., `ground`.
+     * Third, the `ZoneMap` server objects are loaded and constructed within that aforementioned system.
+     * To avoid being called more than once, there is a test whether the globally unique identifier system has been changed.<br>
+     * <br>
+     * Execution of this operation should be fail-safe.
+     * The chances of failure should be mitigated or skipped.
+     * A testing routine should be run after the fact on the results of the process.
+     *
+     * @see `ZoneActor.ZoneSetupCheck`
+     * @param context a reference to an `ActorContext` necessary for `Props`
+     */
+    def init(zone: Zone)(implicit context: ActorContext): Boolean = {
+      implicit val guid: NumberPoolHub = zone.guid //passed into builderObject.Build implicitly
+      if (zone.unops == null) {
+        val id = s"zone-${zone.id}"
+        zone.SetupNumberPools()
+        context.actorOf(Props(classOf[UniqueNumberSys], zone, zone.guid), s"$id-uns")
+        zone.ground = context.actorOf(Props(classOf[ZoneGroundActor], zone, zone.equipmentOnGround), s"$id-ground")
+        zone.deployables = context.actorOf(Props(classOf[ZoneDeployableActor], zone, zone.constructions, zone.linkDynamicTurretWeapon), s"$id-deployables")
+        zone.projectiles = context.actorOf(Props(classOf[ZoneProjectileActor], zone, zone.projectileList), s"$id-projectiles")
+        zone.transport = context.actorOf(Props(classOf[ZoneVehicleActor], zone, zone.vehicles, zone.linkDynamicTurretWeapon), s"$id-vehicles")
+        zone.population = context.actorOf(Props(classOf[ZonePopulationActor], zone, zone.players, zone.bots, zone.corpses), s"$id-players")
+        zone.projector = context.actorOf(
+          Props(classOf[ZoneHotSpotDisplay], zone, zone.hotspots, 15 seconds, zone.hotspotHistory, 60 seconds),
+          s"$id-hotspots"
+        )
+        zone.soi = context.actorOf(Props(classOf[SphereOfInfluenceActor], zone), s"$id-soi")
+
+        //enable target spawns for VR Shooting Range zones
+        if (zone.id.startsWith("tzsh")) {
+          zone.npcPopulation = context.actorOf(Props(classOf[ShootingRangeTargetSpawnerActor], zone), s"$id-npcs")
+        }
+        zone.avatarEvents = context.actorOf(AvatarService(), s"$id-avatar-events")
+        zone.localEvents = context.actorOf(LocalService(zone), s"$id-local-events")
+        zone.vehicleEvents = context.actorOf(VehicleService(), s"$id-vehicle-events")
+
+        zone.timeOfDayOrigin = System.currentTimeMillis()
+
+        BuildLocalObjects(zone)(context, guid)
+        BuildSupportObjects(zone)
+        MakeBuildings(zone)(context, guid)
+        MakeLattice(zone)
+        AssignAmenities(zone)
+        CreateSpawnGroups(zone)
+        PopulateBlockMap(zone)
+      }
+      Validate(zone)
+    }
+
+    private def BuildLocalObjects(zone: Zone)(implicit context: ActorContext, guid: NumberPoolHub): Unit = {
+      zone.map.localObjects.foreach { builderObject =>
+        builderObject.Build
+        val obj = guid(builderObject.Id)
+        obj collect {
+          case el: ZoneAware => el.Zone = zone
+        }
+      }
+    }
+
+    private def BuildSupportObjects(zone: Zone)(implicit guid: NumberPoolHub): Unit = {
+      //guard against errors here, but don't worry about specifics; let ZoneActor.ZoneSetupCheck complain about problems
+      val other: ListBuffer[PlanetSideGameObject] = new ListBuffer[PlanetSideGameObject]()
+      //turret to weapon
+      zone.map.turretToWeapon.foreach {
+        case (turret_guid, weapon_guid) =>
+          ((zone.GUID(turret_guid) match {
+            case Some(obj: FacilityTurret) =>
+              Some(obj)
+            case _ => ()
+              None
+          }) match {
+            case Some(obj) =>
+              obj.Weapons.get(1) match {
+                case Some(slot) =>
+                  Some(obj, slot.Equipment)
+                case None =>
+                  None
+              }
+            case None =>
+              None
+          }) match {
+            case Some((obj, Some(weapon: Tool))) =>
+              guid.register(weapon, weapon_guid)
+              other ++= weapon.AmmoSlots.map(slot => slot.Box)
+              other ++= obj.Inventory.Items.map(item => item.obj) //internal ammunition reserves, if any
+            case _ => ()
+          }
+      }
+      //after all fixed GUID's are defined  ...
+      other.foreach(obj => guid.register(obj, obj.Definition.registerAs))
+    }
+
+    private def MakeBuildings(zone: Zone)(implicit context: ActorContext, guid: NumberPoolHub): PairMap[Int, Building] = {
+      val buildingList = zone.map.localBuildings
+      val registrationKeys: Map[Int, Try[LoanedKey]] = buildingList.map {
+        case ((_, building_guid: Int, _), _) =>
+          (building_guid, guid.register(building_guid))
+      }
+      zone.buildings = buildingList.map {
+        case ((name, building_guid, map_id), constructor) if registrationKeys(building_guid).isSuccess =>
+          val building = constructor.Build(name, building_guid, map_id, zone)
+          registrationKeys(building_guid).get.Object = building
+          building_guid -> building
+      }
+      zone.buildings
+    }
+
+    private def AssignAmenities(zone: Zone)(implicit guid: NumberPoolHub): Unit = {
+      val map = zone.map
+      val buildings = zone.buildings
+      map.objectToBuilding.foreach {
+        case (object_guid, building_id) =>
+          (buildings.get(building_id), guid(object_guid)) match {
+            case (Some(building), Some(amenity: Amenity)) =>
+              building.Amenities = amenity
+            case (Some(_), _) | (None, _) | (_, None) => () //let ZoneActor's sanity check catch this error
+          }
+      }
+      Zone.AssignOutwardSideToDoors(zone)
+      Zone.AssignSidednessToAmenities(zone)
+      //ntu management (eventually move to a generic building startup function)
+      buildings.values
+        .flatMap(_.Amenities.filter(_.Definition == GlobalDefinitions.resource_silo))
+        .collect {
+          case silo: ResourceSilo =>
+            silo.Actor ! Service.Startup
+        }
+      //some painfields need to look for their closest door
+      buildings.values
+        .flatMap(_.Amenities.filter(_.Definition.isInstanceOf[PainboxDefinition]))
+        .collect {
+          case painbox: Painbox =>
+            painbox.Actor ! Service.Startup
+        }
+      //the orbital_buildings in sanctuary zones have to establish their shuttle routes
+      map.shuttleBays
+        .map {
+          guid(_)
+        }
+        .collect { case Some(obj: OrbitalShuttlePad) =>
+          obj.Actor ! Service.Startup
+        }
+      //allocate soi information
+      zone.soi ! SOI.Build()
+    }
+
+    private def MakeLattice(zone: Zone): Unit = {
+      zone.lattice ++= zone.map.latticeLink
+        .filterNot { case (a, _) => a.contains("/") } //ignore intercontinental lattice connections
+        .map {
+          case (source, target) =>
+            val (sourceBuilding, targetBuilding) = (zone.Building(source), zone.Building(target)) match {
+              case (Some(sBuilding), Some(tBuilding)) => (sBuilding, tBuilding)
+              case _ =>
+                throw new NoSuchElementException(s"Zone ${zone.id} - can't create lattice link between $source and $target.")
+            }
+            sourceBuilding ~ targetBuilding
+        }
+    }
+
+    private def CreateSpawnGroups(zone: Zone): Unit = {
+      val allBuildings = zone.buildings.values.filterNot { _.Position == Vector3.Zero }
+      allBuildings
+        .map { building => { building -> building.Amenities.collect { case obj: SpawnPoint => obj } } }
+        .filter { case (_, spawns) => spawns.nonEmpty }
+        .foreach { zone.SpawnGroups }
+      allBuildings
+        .collect { case building: WarpGate => building -> List(building.asInstanceOf[SpawnPoint]) }
+        .foreach { zone.SpawnGroups }
+    }
+
+    private def PopulateBlockMap(zone: Zone): Unit = {
+      val blockMap = zone.blockMap
+      zone.vehicles.foreach { vehicle => blockMap.addTo(vehicle) }
+      zone.buildings.values.foreach { building =>
+        blockMap.addTo(building)
+        building.Amenities.foreach { amenity => blockMap.addTo(amenity) }
+      }
+      zone.map.environment.foreach { env => blockMap.addTo(env) }
+    }
+
+    def Validate(zone: Zone)(implicit guid: NumberPoolHub): Boolean = {
+      implicit val log: Logger = org.log4s.getLogger(s"zone/${zone.id}/sanity")
+      val map = zone.map
+      val counter: AtomicInteger = new AtomicInteger()
+      val validateUsing: (Int, PlanetSideGameObject => Boolean, String) => Boolean = validateObject(zone, counter)
+
+      //check bases
+      map.objectToBuilding.values
+        .toSet[Int]
+        .foreach(building_id => {
+          val target = zone.Building(building_id)
+          if (target.isEmpty) {
+            log.error(s"expected a building for id #$building_id")
+          } else if (!target.get.HasGUID) {
+            log.error(s"building #$building_id was not registered")
+          }
+        })
+
+      //check base to object associations
+      map.objectToBuilding.keys.foreach(object_guid =>
+        if (guid(object_guid).isEmpty) {
+          log.error(s"expected object id $object_guid to exist, but it did not")
+        }
+      )
+
+      //check door to lock association
+      map.doorToLock.foreach({
+        case (doorGuid, lockGuid) =>
+          validateUsing(doorGuid, (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.doors.Door], "door")
+          validateUsing(lockGuid, (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.locks.IFFLock], "IFF lock")
+      })
+
+      //check vehicle terminal to spawn pad association
+      map.terminalToSpawnPad.foreach({
+        case (termGuid, padGuid) =>
+          validateUsing(
+            termGuid,
+            (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.terminals.Terminal],
+            "vehicle terminal"
+          )
+          validateUsing(
+            padGuid,
+            (x: PlanetSideGameObject) => x.isInstanceOf[serverobject.pad.VehicleSpawnPad],
+            "vehicle spawn pad"
+          )
+      })
+
+      //check implant terminal mech to implant terminal interface association
+      map.terminalToInterface.foreach({
+        case (mechGuid, interfaceGuid) =>
+          validateUsing(
+            mechGuid,
+            (x: PlanetSideGameObject) => x.isInstanceOf[ImplantTerminalMech],
+            "implant terminal mech"
+          )
+          validateUsing(
+            interfaceGuid,
+            (o: PlanetSideGameObject) => o.isInstanceOf[serverobject.terminals.Terminal],
+            "implant terminal interface"
+          )
+      })
+
+      //check manned turret to weapon association
+      map.turretToWeapon.foreach({
+        case (turretGuid, weaponGuid) =>
+          validateUsing(
+            turretGuid,
+            (o: PlanetSideGameObject) => o.isInstanceOf[serverobject.turret.FacilityTurret],
+            "facility turret mount"
+          )
+          if (
+            validateUsing(
+              weaponGuid,
+              (o: PlanetSideGameObject) => o.isInstanceOf[net.psforever.objects.Tool],
+              "facility turret weapon"
+            )
+          ) {
+            if (zone.GUID(weaponGuid).get.asInstanceOf[Tool].AmmoSlots.count(!_.Box.HasGUID) > 0) {
+              log.error(s"expected weapon $weaponGuid has an unregistered ammunition unit")
+            }
+          }
+      })
+      counter.get() == 0
+    }
+
+    /**
+     * Recover an object from a collection and perform any number of validating tests upon it.
+     * If the object fails any tests, log an error.
+     *
+     * @param objectGuid  the unique indentifier being checked against the `guid` access point
+     * @param test        a test for the discovered object;
+     *                    expects at least `Type` checking
+     * @param description an explanation of how the object, if not discovered, should be identified
+     * @return `true` if the object was discovered and validates correctly;
+     *         `false` if the object failed any tests
+     */
+    def validateObject(
+                        zone: Zone,
+                        counter: AtomicInteger
+                      )
+                      (
+                        objectGuid: Int,
+                        test: PlanetSideGameObject => Boolean,
+                        description: String
+                      )(implicit log: Logger): Boolean = {
+      try {
+        if (!test(zone.GUID(objectGuid).get)) {
+          log.error(s"expected id $objectGuid to be a $description, but it was not")
+          counter.incrementAndGet()
+          false
+        } else {
+          true
+        }
+      } catch {
+        case e: Exception =>
+          log.error(s"expected a $description at id $objectGuid but no object is initialized - $e")
+          counter.incrementAndGet()
+          false
+      }
+    }
+  }
+
+  /* explosions */
+
+  /**
+   * Allocates `Damageable` targets within the vicinity of server-prepared damage dealing
+   * and informs those entities that they have affected by the aforementioned damage.
+   * Usually, this is considered an "explosion;" but, the application can be utilized for a variety of unbound damage.
+   * @param zone the zone in which the damage should occur
+   * @param source the entity that embodies the damage (information)
+   * @param createInteraction how the interaction for this damage is to prepared
+   * @return a list of affected entities;
+   *         only mostly complete due to the exclusion of objects whose damage resolution is different than usual
+   */
+  def serverSideDamage(
+                        zone: Zone,
+                        source: PlanetSideGameObject with FactionAffinity with Vitality,
+                        createInteraction: (PlanetSideGameObject with FactionAffinity with Vitality, PlanetSideGameObject with FactionAffinity with Vitality) => DamageInteraction
+                      ): List[PlanetSideServerObject] = {
+    source.Definition.innateDamage match {
+      case Some(damage) =>
+        serverSideDamage(zone, source, damage, createInteraction, distanceCheck, findAllTargets)
+      case None =>
+        Nil
+    }
+  }
+
+  /**
     * Allocates `Damageable` targets within the vicinity of server-prepared damage dealing
     * and informs those entities that they have affected by the aforementioned damage.
     * Usually, this is considered an "explosion;" but, the application can be utilized for a variety of unbound damage.
     * @param zone the zone in which the damage should occur
     * @param source the entity that embodies the damage (information)
     * @param createInteraction how the interaction for this damage is to prepared
-    * @param testTargetsFromZone a custom test for determining whether the allocated targets are affected by the damage
-    * @param acquireTargetsFromZone the main target-collecting algorithm
+    * @param testTargetsFromZone a custom test for determining whether the allocated targets are affected by the damage;
+    *                            filters targets from the existing selection
+    * @param acquireTargetsFromZone the main target-collecting algorithm;
+    *                               collects targets from sector information
     * @return a list of affected entities;
     *         only mostly complete due to the exclusion of objects whose damage resolution is different than usual
     */
@@ -1125,8 +1962,8 @@ object Zone {
                         zone: Zone,
                         source: PlanetSideGameObject with FactionAffinity with Vitality,
                         createInteraction: (PlanetSideGameObject with FactionAffinity with Vitality, PlanetSideGameObject with FactionAffinity with Vitality) => DamageInteraction,
-                        testTargetsFromZone: (PlanetSideGameObject, PlanetSideGameObject, Float) => Boolean = distanceCheck,
-                        acquireTargetsFromZone: (Zone, PlanetSideGameObject with FactionAffinity with Vitality, DamageWithPosition) => List[PlanetSideServerObject with Vitality] = findAllTargets
+                        testTargetsFromZone: (PlanetSideGameObject, PlanetSideGameObject, Float) => Boolean,
+                        acquireTargetsFromZone: (Zone, PlanetSideGameObject with FactionAffinity with Vitality, DamageWithPosition) => List[PlanetSideServerObject with Vitality]
                     ): List[PlanetSideServerObject] = {
     source.Definition.innateDamage match {
       case Some(damage) =>
@@ -1151,8 +1988,10 @@ object Zone {
     * @param zone the zone in which the damage should occur
     * @param source the entity that embodies the damage (information)
     * @param createInteraction how the interaction for this damage is to prepared
-    * @param testTargetsFromZone a custom test for determining whether the allocated targets are affected by the damage
-    * @param acquireTargetsFromZone the main target-collecting algorithm
+    * @param testTargetsFromZone a custom test for determining whether the allocated targets are affected by the damage;
+    *                            filters targets from the existing selection
+    * @param acquireTargetsFromZone the main target-collecting algorithm;
+    *                               collects targets from sector information
     * @return a list of affected entities;
     *         only mostly complete due to the exclusion of objects whose damage resolution is different than usual
     */
@@ -1171,47 +2010,112 @@ object Zone {
     val allAffectedTargets = pssos.filter { target => testTargetsFromZone(source, target, radius) }
     //inform remaining targets that they have suffered damage
     allAffectedTargets
-      .foreach { target => target.Actor ! Vitality.Damage(createInteraction(source, target).calculate()) }
+      .foreach { target =>
+      if (target.Zone.isVR) {
+        //disable all server-side damage in VR zones, unless the target is a bot in the VR Shooting Range
+        target match {
+          case bot: AvatarBot =>
+            target.Actor ! Vitality.Damage(createInteraction(source, target).calculate())
+          case _ =>
+        }
+      } else {
+        target.Actor ! Vitality.Damage(createInteraction(source, target).calculate())
+      }
+    }
     allAffectedTargets
   }
 
   /**
-    * na
-    * @see `DamageWithPosition`
-    * @see `Zone.blockMap.sector`
-    * @param zone   the zone in which the explosion should occur
-    * @param source a game entity that is treated as the origin and is excluded from results
-    * @param damagePropertiesBySource information about the effect/damage
-    * @return a list of affected entities
-    */
-  def findAllTargets(
-                      zone: Zone,
-                      source: PlanetSideGameObject with Vitality,
-                      damagePropertiesBySource: DamageWithPosition
-                    ): List[PlanetSideServerObject with Vitality] = {
-    findAllTargets(zone, source.Position, damagePropertiesBySource).filter { target => target ne source }
+   * na
+   * @param source na
+   * @param damageProperties na
+   * @param targets na
+   * @return na
+   */
+  def allOnSameSide(
+                     source: PlanetSideGameObject,
+                     damageProperties: DamageWithPosition,
+                     targets: List[PlanetSideServerObject with Vitality]
+                   ): List[PlanetSideServerObject with Vitality] = {
+    source match {
+      case awareSource: InteriorAware if !damageProperties.DamageThroughWalls =>
+        allOnSameSide(awareSource.WhichSide, targets)
+      case _ if !damageProperties.DamageThroughWalls =>
+        val sourcePosition = source.Position
+        targets
+          .sortBy(t => Vector3.DistanceSquared(sourcePosition, t.Position))
+          .collectFirst { case awareSource: InteriorAware => allOnSameSide(awareSource.WhichSide, targets) }
+          .getOrElse(targets)
+      case _ =>
+        targets
+    }
+  }
+
+  /**
+   * na
+   * @param side na
+   * @param targets na
+   * @return na
+   */
+  def allOnSameSide(
+                     side: Sidedness,
+                     targets: List[PlanetSideServerObject with Vitality]
+                   ): List[PlanetSideServerObject with Vitality] = {
+    targets.flatMap {
+      case awareTarget: InteriorAware if !Sidedness.equals(side, awareTarget.WhichSide) => None
+      case anyTarget => Some(anyTarget)
+    }
   }
 
   /**
     * na
     * @see `DamageWithPosition`
     * @see `Zone.blockMap.sector`
-    * @param sourcePosition a custom position that is used as the origin of the explosion;
-    *                       not necessarily related to source
     * @param zone   the zone in which the explosion should occur
     * @param source a game entity that is treated as the origin and is excluded from results
     * @param damagePropertiesBySource information about the effect/damage
     * @return a list of affected entities
     */
   def findAllTargets(
-                      sourcePosition: Vector3
-                    )
-                    (
                       zone: Zone,
                       source: PlanetSideGameObject with Vitality,
                       damagePropertiesBySource: DamageWithPosition
                     ): List[PlanetSideServerObject with Vitality] = {
-    findAllTargets(zone, sourcePosition, damagePropertiesBySource).filter { target => target ne source }
+    findAllTargets(
+      zone,
+      source,
+      source.Position,
+      damagePropertiesBySource,
+      damagePropertiesBySource.DamageRadius,
+      getAllTargets
+    )
+  }
+
+  /**
+    * na
+    * @see `DamageWithPosition`
+    * @see `Zone.blockMap.sector`
+    * @param zone   the zone in which the explosion should occur
+    * @param sourcePosition a custom position that is used as the origin of the explosion;
+    *                       not necessarily related to source
+    * @param source a game entity that is treated as the origin and is excluded from results
+    * @param damagePropertiesBySource information about the effect/damage
+    * @return a list of affected entities
+    */
+  def findAllTargets(
+                      zone: Zone,
+                      source: PlanetSideGameObject with Vitality,
+                      sourcePosition: Vector3,
+                      damagePropertiesBySource: DamageWithPosition
+                    ): List[PlanetSideServerObject with Vitality] = {
+    findAllTargets(
+      zone,
+      source,
+      sourcePosition,
+      damagePropertiesBySource,
+      damagePropertiesBySource.DamageRadius,
+      getAllTargets
+    )
   }
 
   /**
@@ -1221,26 +2125,119 @@ object Zone {
     * @param zone   the zone in which the explosion should occur
     * @param sourcePosition a position that is used as the origin of the explosion
     * @param damagePropertiesBySource information about the effect/damage
+    * @param getTargetsFromSector get this list of entities from a sector
     * @return a list of affected entities
     */
   def findAllTargets(
                       zone: Zone,
+                      source: PlanetSideGameObject with Vitality,
                       sourcePosition: Vector3,
-                      damagePropertiesBySource: DamageWithPosition
+                      damagePropertiesBySource: DamageWithPosition,
+                      radius: Float,
+                      getTargetsFromSector: SectorPopulation => List[PlanetSideServerObject with Vitality]
                     ): List[PlanetSideServerObject with Vitality] = {
-    val sourcePositionXY = sourcePosition.xy
-    val sectors = zone.blockMap.sector(sourcePositionXY, damagePropertiesBySource.DamageRadius)
+    allOnSameSide(
+      source,
+      damagePropertiesBySource,
+      findAllTargets(zone, sourcePosition, radius, getTargetsFromSector).filter { target => target ne source }
+    )
+  }
+
+  def findAllTargets(
+                      sector: SectorPopulation,
+                      source: PlanetSideGameObject with Vitality,
+                      damagePropertiesBySource: DamageWithPosition,
+                      getTargetsFromSector: SectorPopulation => List[PlanetSideServerObject with Vitality]
+                    ): List[PlanetSideServerObject with Vitality] = {
+    allOnSameSide(
+      source,
+      damagePropertiesBySource,
+      getTargetsFromSector(sector)
+    )
+  }
+
+  /**
+   * na
+   * @see `DamageWithPosition`
+   * @see `Zone.blockMap.sector`
+   * @param zone   the zone in which the explosion should occur
+   * @param sourcePosition a position that is used as the origin of the explosion
+   * @param radius idistance
+   * @param getTargetsFromSector get this list of entities from a sector
+   * @return a list of affected entities
+   */
+  def findAllTargets(
+                      zone: Zone,
+                      sourcePosition: Vector3,
+                      radius: Float,
+                      getTargetsFromSector: SectorPopulation => List[PlanetSideServerObject with Vitality]
+                    ): List[PlanetSideServerObject with Vitality] = {
+    getTargetsFromSector(zone.blockMap.sector(sourcePosition.xy, radius))
+  }
+
+  def getAllTargets(sector: SectorPopulation): List[PlanetSideServerObject with Vitality] = {
     //collect all targets that can be damaged
     //players
-    val playerTargets = sectors.livePlayerList.filterNot { _.VehicleSeated.nonEmpty }
+    val playerTargets = sector.livePlayerList.filterNot { _.VehicleSeated.nonEmpty }
+    //bots
+    val botTargets = sector.botList
     //vehicles
-    val vehicleTargets = sectors.vehicleList.filterNot { v => v.Destroyed || v.MountedIn.nonEmpty }
+    val vehicleTargets = sector.vehicleList.filterNot { v => v.Destroyed || v.MountedIn.nonEmpty }
     //deployables
-    val deployableTargets = sectors.deployableList.filterNot { _.Destroyed }
+    val deployableTargets = sector.deployableList.filterNot { _.Destroyed }
     //amenities
-    val soiTargets = sectors.amenityList.collect { case amenity: Vitality if !amenity.Destroyed => amenity }
+    val soiTargets = sector.amenityList.collect { case amenity: Vitality if !amenity.Destroyed => amenity }
     //altogether ...
-    playerTargets ++ vehicleTargets ++ deployableTargets ++ soiTargets
+    playerTargets ++ botTargets ++ vehicleTargets ++ deployableTargets ++ soiTargets
+  }
+
+  /**
+    * na
+    * @see `DamageWithPosition`
+    * @see `Zone.blockMap.sector`
+    * @param zone   the zone in which the explosion should occur
+    * @param sourcePosition a position that is used as the origin of the explosion
+    * @param radius idistance
+    * @param getTargetsFromSector get this list of entities from a sector
+    * @return a list of affected entities
+    */
+  def findOrbitalStrikeTargets(
+                      zone: Zone,
+                      sourcePosition: Vector3,
+                      radius: Float,
+                      getTargetsFromSector: SectorPopulation => List[PlanetSideServerObject with Vitality]
+                    ): List[PlanetSideServerObject with Vitality] = {
+    getTargetsFromSector(zone.blockMap.sector(sourcePosition.xy, radius))
+  }
+
+  def getOrbitbalStrikeTargets(sector: SectorPopulation): List[PlanetSideServerObject with Vitality] = {
+    //collect all targets that can be damaged
+    //players
+    val playerTargets = sector.livePlayerList.filter { player => player.VehicleSeated.isEmpty && player.WhichSide == Sidedness.OutsideOf }
+    //bots
+    val botTargets = sector.botList.filter { bot => bot.WhichSide == Sidedness.OutsideOf }
+    //vehicles
+    val vehicleTargets = sector.vehicleList.filterNot { _.Destroyed }
+    //deployables
+    val deployableTargets = sector.deployableList.filter { obj => !obj.Destroyed && obj.WhichSide == Sidedness.OutsideOf }
+    //amenities
+    val soiTargets = sector.amenityList.collect {
+      case amenity: Vitality if !amenity.Destroyed && amenity.WhichSide == Sidedness.OutsideOf && amenity.CanDamage => amenity }
+    //altogether ...
+    playerTargets ++ botTargets ++ vehicleTargets ++ deployableTargets ++ soiTargets
+  }
+
+  /**
+    * Check if targets returned from sector are within range of the imminent Orbital Strike
+    * @param p1 OS position
+    * @param p2 target position
+    * @param maxDistance radius of the Orbital Strike
+    * @return `true`, if the two entities are near enough to each other;
+    *        `false`, otherwise
+    */
+  def orbitalStrikeDistanceCheck(p1: Vector3, p2: Vector3, maxDistance: Float): Boolean = {
+    val radius = maxDistance * maxDistance
+    Vector3.DistanceSquared(p1.xy, p2.xy) <= radius
   }
 
   /**
@@ -1258,7 +2255,9 @@ object Zone {
                        target: PlanetSideGameObject with FactionAffinity with Vitality
                      ): DamageInteraction = {
     explosionDamage(instigation, target.Position)(source, target)
-  }/**
+  }
+
+  /**
     * na
     * @param instigation what previous event happened, if any, that caused this explosion
     * @param explosionPosition the coordinates of the detected explosion
@@ -1295,6 +2294,24 @@ object Zone {
     */
   def distanceCheck(obj1: PlanetSideGameObject, obj2: PlanetSideGameObject, maxDistance: Float): Boolean = {
     distanceCheck(obj1.Definition.Geometry(obj1), obj2.Definition.Geometry(obj2), maxDistance)
+  }
+
+  /**
+   * Two game entities are considered "near" each other if they are within a certain distance of one another.
+   * A default function literal mainly used for `serverSideDamage`.
+   * Best used when one entity - `obj1` - is to be reused in tests against multiple other entities
+   * as it skips repeatedly calculating the volumetric geometry of the repeating entity.
+   * @see `ObjectDefinition.Geometry`
+   * @see `serverSideDamage`
+   * @param obj1 the geometric representation of a game entity
+   * @param obj2 a game entity
+   * @param maxDistance the square of the maximum distance permissible between game entities
+   *                    before they are no longer considered "near"
+   * @return `true`, if the two entities are near enough to each other;
+   *        `false`, otherwise
+   */
+  def distanceCheck(obj1: VolumetricGeometry, obj2: PlanetSideGameObject, maxDistance: Float): Boolean = {
+    distanceCheck(obj1, obj2.Definition.Geometry(obj2), maxDistance)
   }
 
   /**
